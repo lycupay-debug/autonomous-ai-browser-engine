@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["experiments/js-runtime/boa-host"]
+
+[workspace.package]
+edition = "2024"
+license = "UNLICENSED"
+repository = "https://github.com/lycupay-debug/autonomous-ai-browser-engine"

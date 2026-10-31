@@ -1,0 +1,8 @@
+[package]
+name = "aibe-boa-host-poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+boa_engine = "=0.22.0"
