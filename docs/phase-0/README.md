@@ -23,3 +23,12 @@ For each experiment, record the exact source revision, OS release, compiler/tool
 ## Exit gate
 
 See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to full runtime implementation while critical DOM/JS lifetime or renderer isolation risks remain unexplained.
+
+## 2026-11-01 execution evidence update
+
+- FreeBSD native Boa 0.22.0 host embedding: 7 tests passed.
+- Minimal native DOM-like wrapper: JS class construction and parent/child graph test passed.
+- Lifecycle: unrooted JS self-reference plus cross-linked native node graph was collected; wrapper and native state finalizers were observed.
+- Scheduling: Promise callbacks remained queued until the host called `Context::run_jobs()`; this is an engine job pump, not a WHATWG HTML event loop.
+- Capsicum: path-based `/etc/passwd` open denied after `cap_enter()`, errno 94.
+- Remaining: selected Test262 suite, actual renderer process isolation, FD rights, jail/network boundaries, and broader lifecycle stress tests.
