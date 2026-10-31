@@ -19,8 +19,11 @@ This repository is in **Phase 0: technical feasibility research**. It is not a u
 
 ## Repository layout
 
-- `experiments/js-runtime/boa-host/`: isolated Boa embedding feasibility PoC.
-- `experiments/security/capsicum-minimal/`: FreeBSD Capsicum descriptor-rights and capability-mode negative-test PoC.
+- `experiments/js-runtime/boa-host/`: Boa embedding, DOM/JS lifecycle, Test262 subset and script runner PoCs.
+- `experiments/js-runtime/native-embed/`: FreeBSD V8 and SpiderMonkey C++ embedding PoCs.
+- `experiments/js-runtime/ffi-poc/`: Rust-owned RAII wrappers over native V8 and SpiderMonkey C ABI.
+- `experiments/js-runtime/benchmarks/`: common cross-runtime JavaScript microbenchmark.
+- `experiments/security/`: FreeBSD Capsicum Broker/Renderer and Jail network-isolation negative-test PoCs.
 - `experiments/headless/raster-poc/`: CPU glyph rasterization and PNG output PoC.
 - `experiments/network-policy/`: outbound IP classification and DNS answer-set policy PoC.
 - `experiments/control-protocol/uds-poc/`: versioned JSON-over-UDS contract and task-state tests.
@@ -36,11 +39,15 @@ cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ./scripts/run-test262-subset.sh
+AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local ./scripts/build-native-js-runtimes.sh
+AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib AIBE_V8_EXECUTABLE=/tmp/aibe-runtime-root/usr/local/bin/d8 cargo test -p aibe-js-runtime-ffi-poc --locked
+AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local ./scripts/run-test262-shells.sh
 clang -Wall -Wextra -Werror -O2 experiments/security/capsicum-minimal/src/main.c -o /tmp/aibe-capsicum-minimal
 /tmp/aibe-capsicum-minimal
+./scripts/run-security-pocs.sh
 ```
 
-The Test262 runner executes a pinned, deliberately limited synchronous subset; it is not full Test262 conformance. The Capsicum test demonstrates only descriptor-rights and capability-mode restrictions. It is not a browser sandbox or proof of renderer isolation. The headless raster PoC requires an external font file and does not implement shaping or layout.
+The Test262 runners execute a pinned, deliberately limited synchronous subset across Boa, V8 and SpiderMonkey; they are not full Test262 conformance. The V8/SpiderMonkey scripts require FreeBSD runtime packages extracted under `/tmp` as documented in `docs/phase-0/js-runtime-comparison.md`. The Capsicum test demonstrates only descriptor-rights and capability-mode restrictions. It is not a browser sandbox or proof of renderer isolation. The headless raster PoC requires an external font file and does not implement shaping or layout.
 
 ## Decisions and licensing
 

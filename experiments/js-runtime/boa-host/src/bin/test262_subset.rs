@@ -99,7 +99,13 @@ fn expected_negative_type(source: &str) -> Option<String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
-    let root = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/aibe-test262".into()));
+    let first = args.next().unwrap_or_else(|| "/tmp/aibe-test262".into());
+    let list_only = first == "--list";
+    let root = if list_only {
+        PathBuf::from(args.next().unwrap_or_else(|| "/tmp/aibe-test262".into()))
+    } else {
+        PathBuf::from(first)
+    };
     let directories: Vec<PathBuf> = args.map(|path| root.join(path)).collect();
     if directories.is_empty() {
         eprintln!("usage: test262_subset <test262-root> <relative-test-directory> [...]");
@@ -132,6 +138,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         executed += 1;
 
+        if list_only {
+            let expected = expected_negative_type(&source).unwrap_or_default();
+            println!("{}\t{}", path.display(), expected);
+            continue;
+        }
+
         let mut context = Context::default();
         let outcome = context
             .eval(Source::from_bytes(&harness))
@@ -156,6 +168,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    if list_only {
+        return Ok(());
     }
 
     println!(
