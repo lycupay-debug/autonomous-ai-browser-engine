@@ -1,0 +1,9 @@
+[package]
+name = "aibe-headless-raster-poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+fontdue = "=0.9.5"
+png = "=0.18.1"

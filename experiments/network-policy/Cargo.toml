@@ -1,0 +1,8 @@
+[package]
+name = "aibe-network-policy-poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+ipnet = "=2.12.2"

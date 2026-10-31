@@ -1,8 +1,14 @@
 # Minimal Capsicum negative test
 
-This small FreeBSD-only program forks a child, enters Capsicum capability mode, and verifies that opening `/etc/passwd` by pathname is denied.
+This FreeBSD-only program prepares an unlinked temporary file, forks a child, reduces the inherited descriptor to `CAP_READ` and `CAP_FSTAT`, and enters Capsicum capability mode.
 
-It does **not** test descriptor-rights minimization, IPC peer authentication, network confinement, jail isolation, renderer compromise, cross-origin isolation, or a complete browser sandbox. Passing this test is one narrow piece of evidence only.
+Expected checks:
+
+- Reading from the inherited descriptor remains allowed.
+- Writing through the descriptor is denied with `ENOTCAPABLE`.
+- Opening `/etc/passwd` by pathname is denied with `ECAPMODE` after `cap_enter()`.
+
+This is still only a narrow primitive test. It does **not** test a complete renderer sandbox, network confinement, jail isolation, process credential separation, IPC peer authentication, cross-origin isolation, or resistance to a compromised browser process.
 
 Build and run on FreeBSD:
 

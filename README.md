@@ -20,8 +20,11 @@ This repository is in **Phase 0: technical feasibility research**. It is not a u
 ## Repository layout
 
 - `experiments/js-runtime/boa-host/`: isolated Boa embedding feasibility PoC.
-- `experiments/security/capsicum-minimal/`: minimal FreeBSD Capsicum negative-test PoC.
-- `docs/phase-0/`: Phase 0 scope, evidence and exit criteria.
+- `experiments/security/capsicum-minimal/`: FreeBSD Capsicum descriptor-rights and capability-mode negative-test PoC.
+- `experiments/headless/raster-poc/`: CPU glyph rasterization and PNG output PoC.
+- `experiments/network-policy/`: outbound IP classification and DNS answer-set policy PoC.
+- `experiments/control-protocol/uds-poc/`: versioned JSON-over-UDS contract and task-state tests.
+- `docs/phase-0/`: Phase 0 scope, capability matrix, evidence, dependency audit and exit criteria.
 - `.github/workflows/`: hosted CI checks; this is not a FreeBSD-native test result.
 
 ## Build and test
@@ -32,11 +35,12 @@ On a FreeBSD 15.1 amd64 host with Rust/Cargo installed:
 cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+./scripts/run-test262-subset.sh
 clang -Wall -Wextra -Werror -O2 experiments/security/capsicum-minimal/src/main.c -o /tmp/aibe-capsicum-minimal
 /tmp/aibe-capsicum-minimal
 ```
 
-The Capsicum test demonstrates only a narrow capability-mode filesystem restriction. It is not a browser sandbox or proof of renderer isolation.
+The Test262 runner executes a pinned, deliberately limited synchronous subset; it is not full Test262 conformance. The Capsicum test demonstrates only descriptor-rights and capability-mode restrictions. It is not a browser sandbox or proof of renderer isolation. The headless raster PoC requires an external font file and does not implement shaping or layout.
 
 ## Decisions and licensing
 
