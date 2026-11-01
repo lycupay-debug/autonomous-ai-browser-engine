@@ -42,7 +42,7 @@ jobs:
       - name: Install cargo-audit 0.22.2
         run: cargo +1.98.1 install cargo-audit --version 0.22.2 --locked
       - name: Audit Rust dependencies against RustSec advisories
-        run: cargo +1.98.1 audit --locked
+        run: cargo +1.98.1 audit
       - name: Install cargo-cyclonedx 0.5.9
         run: cargo +1.98.1 install cargo-cyclonedx --version 0.5.9 --locked
       - name: Generate per-crate CycloneDX SBOMs

@@ -41,7 +41,7 @@ Do not choose or publish a project license until the owner explicitly approves i
 - `rustybuzz` 0.20.1 for OpenType text shaping.
 - `image` 0.25.10 with only PNG, JPEG, GIF, and WebP features enabled.
 - All versions are pinned exactly in workspace manifests and Cargo.lock. Cargo metadata reports 212 packages, including 207 third-party packages with license metadata and five unlicensed project-owned PoC crates.
-- `cargo-audit` and `cargo-deny` are not installed in the FreeBSD host environment. An attempt to install `cargo-audit` did not complete in the tool session; no vulnerability/advisory scan is claimed yet.
+- `cargo-audit` and `cargo-deny` are not installed in the FreeBSD host environment. GitHub Actions installed `cargo-audit` 0.22.2 successfully, but the first invocation failed before scanning because `cargo audit` does not accept Cargo's `--locked` flag. The workflow invocation has been corrected; no advisory result is claimed until the corrected run completes.
 - Five CycloneDX 1.5 SBOMs have now been generated and committed under `sbom/`, one per workspace crate. They describe Rust/Cargo dependencies only and do not include native V8/SpiderMonkey packages, the temporary Noto font, or the FreeBSD base/system package closure.
 
 
