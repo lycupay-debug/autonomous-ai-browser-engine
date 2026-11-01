@@ -771,3 +771,44 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 3. 接入 Network Service/Broker，确保网页网络请求由宿主授权路径代理，不直接开放 Jail 网络。
 4. 对真实 V8 Renderer 进行 10/50/100 并发、复杂页面、长时间运行、崩溃与强制回收测试；采集 memoryuse/RSS、虚拟地址、文件描述符、线程、启动和 teardown 分布后再制定生产 RCTL 预算。
 5. 当前仍是 Snapshot bridge Renderer，不代表完整浏览器 Renderer 已完成，也未部署为生产服务。
+
+
+## 最新研发记录｜2026-11-02（Renderer FD allowlist + SCM_RIGHTS Snapshot grant 集成）
+
+### 架构与代码变更
+
+- 新增 ADR-0003：`docs/adr/0003-renderer-fd-allowlist-and-snapshot-scm-rights.md`。明确 Renderer 进入 Capsicum 前的 descriptor policy，以及 Browser Snapshot descriptor transfer 的 grant 语义。
+- 新增 `experiments/renderer-supervisor/src/fd_policy.rs`：将 Supervisor 认证 UDS 规范化到 FD 3，执行 `closefrom(4)`，仅保留标准 FD 与 Broker UDS；stdin 限制为 `CAP_READ`，stdout/stderr 为 `CAP_WRITE`，Broker UDS 为 `CAP_READ | CAP_WRITE`。通过 `__cap_rights_get` / `cap_rights_contains` 从内核回读并验证精确 rights。FD 3 设置 `FD_CLOEXEC`。Renderer 在 V8 runtime 与 trusted host objects 初始化后、`cap_enter()` 前执行此策略。
+- Supervisor 在启动进程前分配 Renderer instance ID，并通过 `AIBE_RENDERER_INSTANCE_ID` 传入 Renderer；接入的 `RendererPrincipal` 使用同一 ID，避免 Renderer 接收到的 grant envelope 与 Supervisor identity 失配。
+- 新增 `experiments/control-protocol/uds-poc/src/snapshot_descriptor.rs`：使用 FreeBSD `SHM_ANON` 创建匿名 Snapshot 对象；`ftruncate` 设置精确长度，写入 payload 后 rewind、`fchmod(0400)`，将 descriptor rights 限制为 `CAP_READ | CAP_FSTAT`。
+- Broker 使用 kernel `LOCAL_PEERCRED` PID/UID/GID 校验当前 Renderer principal，验证 Snapshot schema 和 frame Document/revision 一致性，消费 `SnapshotGrantRegistry` 的一次性 grant，再通过 `SCM_RIGHTS` 发送一个 descriptor 与固定 104-byte little-endian grant envelope。Envelope 绑定 request ID、Renderer instance/PID/UID/GID、Origin registry/group、grant registry/sequence、Document ID/revision 和 payload length。
+- Renderer 在 Capsicum capability mode 下使用 `recvmsg(MSG_CMSG_CLOEXEC)` 接收 descriptor，拒绝控制消息截断、未知 ancillary、零个/多个 descriptor、错误 envelope、错误 Renderer identity；验证 FD 是只读 regular object、长度与 grant 一致、rights 只有 `CAP_READ | CAP_FSTAT`，并验证 write 操作返回 `ENOTCAPABLE`。随后读取 Snapshot bytes 并再次验证 schema、Document ID 与 revision。
+- FreeBSD 的 `send_supervised_document_snapshot()` 已切换为 SCM_RIGHTS descriptor path；旧 byte-frame codec 保留为协议兼容和独立测试路径。
+
+### 负向与生命周期验证
+
+- Descriptor transport tests：34/34 通过，包括匿名 FD 正向传输、错误 Renderer PID、多个 SCM_RIGHTS descriptor、非法 envelope、拒绝后所有 received FD 均关闭。
+- Broker grant endpoint tests：新增 3 项通过：正确 grant 一次性消费并拒绝 replay；wrong Origin 不消费有效 grant；frame identity mismatch 在 grant 消费/FD 创建前拒绝。
+- Snapshot Bridge process tests：3/3 通过；包括真实 V8 Renderer 在独立 Jail + Capsicum 下双实例并发接收 SCM_RIGHTS Snapshot 并完成 V8 ingestion。
+- Renderer Supervisor Jail tests：4/4 通过。
+- 完整 Rust Workspace：本轮最终统计以 CI / 本记录后续 GitHub Run 为准；所有 workspace tests 已执行并通过。Rustfmt、Workspace Clippy（`-D warnings`）、`git diff --check` 均通过。
+- `scripts/run-security-pocs.sh` 全部通过：Capsicum descriptor rights、Broker/Renderer boundary、UDS peer credentials、Origin storage SCM_RIGHTS、Renderer crash recovery、Jail network isolation、Renderer Jail lifecycle/identity/RCTL。
+- 真实 V8 双 Jail 测试期间，FD allowlist 与 SCM_RIGHTS descriptor read-only policy 均生效；测试结束后 `jls` 无 Jail 残留、`rctl` 无规则残留。
+
+### 安全语义与边界
+
+- Broker 在发送前消费 one-shot grant；发送失败由上层 revoke grant。Renderer 收到 descriptor 后不能通过路径重新打开该对象。
+- Broker 关闭本地 descriptor 不会撤销 Renderer 已接收的 FD；Capsicum rights 只能进一步缩减，不能扩展。对于已经委托的 descriptor，Renderer 进程/Jail 终止仍是强制撤销边界。
+- 目前 SCM_RIGHTS 只承载 immutable DOM Snapshot payload，不是通用文件系统/Storage 授权。Storage capability 仍使用独立的 Origin-scoped grant 模型。
+- 当前实现为 FreeBSD 专用路径，不代表 Linux、Windows 或 macOS 已支持相同隔离能力。
+- 尚未完成 Network Service/Broker 真实出站、10/50/100 Renderer 并发与长时间压力测量、生产 RCTL memory/swap 预算、完整 typed DOM/Web IDL/live mutation、CSS/Layout/Paint 和真实网站闭环。
+
+### 主机与生产保护
+
+- 本轮仅在独立 Git worktree `/tmp/aibe-renderer-fd-rights` 中修改、编译和测试。未修改主工作区以外的服务配置。
+- 未修改持久 Jail/RCTL 配置；未设置生产 RCTL 限额；未重启 GSM、PostgreSQL、Caddy 或主机；未部署生产 Renderer。
+- 实验结束后 `jls`、`rctl` 均为空；GSM/PostgreSQL 未受影响。
+
+### GitHub 交付状态
+
+- 本子阶段代码将通过独立 PR 提交；只有 Rust 与 supply-chain CI 均成功、PR 合并后，才把该交付标记为主分支已集成。

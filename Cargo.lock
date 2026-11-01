@@ -39,6 +39,7 @@ version = "0.1.0"
 dependencies = [
  "aibe-broker-policy-poc",
  "aibe-origin-policy-poc",
+ "libc",
  "serde_json",
 ]
 
@@ -103,6 +104,7 @@ dependencies = [
  "aibe-js-runtime-ffi-poc",
  "aibe-origin-policy-poc",
  "aibe-renderer-supervisor-poc",
+ "libc",
  "serde_json",
 ]
 

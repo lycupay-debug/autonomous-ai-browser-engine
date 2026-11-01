@@ -11,29 +11,42 @@ use std::os::unix::net::UnixStream;
 use aibe_broker_policy_poc::{RendererPrincipal, SnapshotGrantRegistry};
 use aibe_browser_runtime_origin_poc::OriginRealmRuntime;
 use aibe_browser_runtime_origin_poc::navigation::{FrameId, NavigationController};
+#[cfg(target_os = "freebsd")]
+use aibe_control_protocol_uds_poc::snapshot_endpoint::send_authorized_snapshot_descriptor;
 use aibe_control_protocol_uds_poc::snapshot_endpoint::{
     SnapshotTransferReceipt, send_authorized_snapshot,
 };
 use aibe_control_protocol_uds_poc::snapshot_frame::DomSnapshotFrame;
 use aibe_renderer_supervisor_poc::RendererSupervisor;
 
-/// Sends the current committed Document snapshot using only host-owned
-/// Document/Origin/revision metadata. No page-provided identity is accepted.
-pub fn send_current_document_snapshot<R: OriginRealmRuntime>(
+/// Issue the one-shot grant from the current committed Document and delegate
+/// the transport to a platform-specific, already-authenticated Broker channel.
+fn send_current_document_snapshot_with<R, F>(
     controller: &NavigationController<R>,
     frame: FrameId,
     stream: &mut UnixStream,
     renderer: RendererPrincipal,
     request_id: u64,
     grants: &mut SnapshotGrantRegistry,
-) -> io::Result<SnapshotTransferReceipt> {
+    transfer: F,
+) -> io::Result<SnapshotTransferReceipt>
+where
+    R: OriginRealmRuntime,
+    F: FnOnce(
+        &mut UnixStream,
+        RendererPrincipal,
+        aibe_origin_policy_poc::OriginGroupId,
+        aibe_broker_policy_poc::SnapshotGrantId,
+        &mut SnapshotGrantRegistry,
+        &DomSnapshotFrame,
+    ) -> io::Result<SnapshotTransferReceipt>,
+{
     if request_id == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "snapshot request ID must be nonzero",
         ));
     }
-
     let snapshot = controller
         .current_document_snapshot(frame)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -52,17 +65,38 @@ pub fn send_current_document_snapshot<R: OriginRealmRuntime>(
         revision: snapshot.revision(),
         payload: snapshot.payload().to_vec(),
     };
-
-    match send_authorized_snapshot(stream, renderer, origin, grant, grants, &outbound) {
+    match transfer(stream, renderer, origin, grant, grants, &outbound) {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
-            // Failed authentication/validation leaves the grant unused; a
-            // partial write consumes it. In either case remove its registry
-            // record so a failed transfer cannot exhaust the Renderer quota.
+            // Failed or partial transfers must not leave an unusable grant
+            // occupying the per-Renderer/global quota.
             let _ = grants.revoke(grant);
             Err(error)
         }
     }
+}
+
+/// Sends the current committed Document snapshot using only host-owned
+/// Document/Origin/revision metadata. No page-provided identity is accepted.
+pub fn send_current_document_snapshot<R: OriginRealmRuntime>(
+    controller: &NavigationController<R>,
+    frame: FrameId,
+    stream: &mut UnixStream,
+    renderer: RendererPrincipal,
+    request_id: u64,
+    grants: &mut SnapshotGrantRegistry,
+) -> io::Result<SnapshotTransferReceipt> {
+    send_current_document_snapshot_with(
+        controller,
+        frame,
+        stream,
+        renderer,
+        request_id,
+        grants,
+        |stream, renderer, origin, grant, grants, frame| {
+            send_authorized_snapshot(stream, renderer, origin, grant, grants, frame)
+        },
+    )
 }
 
 /// Reserve the request ID in the process supervisor before issuing any
@@ -82,7 +116,24 @@ pub fn send_supervised_document_snapshot<R: OriginRealmRuntime>(
             "Renderer has no authenticated supervisor connection",
         )
     })?;
-    send_current_document_snapshot(controller, frame, stream, renderer, request_id, grants)
+    #[cfg(target_os = "freebsd")]
+    {
+        send_current_document_snapshot_with(
+            controller,
+            frame,
+            stream,
+            renderer,
+            request_id,
+            grants,
+            |stream, renderer, origin, grant, grants, frame| {
+                send_authorized_snapshot_descriptor(stream, renderer, origin, grant, grants, frame)
+            },
+        )
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        send_current_document_snapshot(controller, frame, stream, renderer, request_id, grants)
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aibe_broker_policy_poc::{GrantRegistry, RendererId, RendererPrincipal, SnapshotGrantRegistry};
 use aibe_control_protocol_uds_poc::{bind_private_socket, peer_process_credentials};
 
+pub mod fd_policy;
+
 #[cfg(target_os = "freebsd")]
 mod freebsd_jail;
 #[cfg(target_os = "freebsd")]
@@ -151,6 +153,15 @@ pub struct RendererSupervisor {
     socket_directory: PathBuf,
 }
 
+fn next_renderer_id() -> io::Result<RendererId> {
+    let instance = NEXT_RENDERER_INSTANCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| io::Error::other("Renderer instance ID exhausted"))?;
+    RendererId::new(instance).ok_or_else(|| io::Error::other("Renderer instance ID is zero"))
+}
+
 impl RendererSupervisor {
     pub fn new(socket_directory: impl AsRef<Path>) -> Self {
         Self::with_request_quotas(socket_directory, 4096, 256)
@@ -190,6 +201,7 @@ impl RendererSupervisor {
         mut command: Command,
         connect_timeout: Duration,
     ) -> io::Result<RendererPrincipal> {
+        let renderer_id = next_renderer_id()?;
         let socket_path = self.next_socket_path()?;
         let listener = bind_private_socket(&socket_path)?;
         if let Err(error) = listener.set_nonblocking(true) {
@@ -197,7 +209,9 @@ impl RendererSupervisor {
             let _ = std::fs::remove_file(&socket_path);
             return Err(error);
         }
-        command.arg(&socket_path);
+        command
+            .arg(&socket_path)
+            .env("AIBE_RENDERER_INSTANCE_ID", renderer_id.value().to_string());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -207,7 +221,7 @@ impl RendererSupervisor {
             }
         };
 
-        let accepted = self.accept_child(&listener, &mut child, connect_timeout);
+        let accepted = self.accept_child(&listener, &mut child, renderer_id, connect_timeout);
         drop(listener);
         let (stream, principal) = match accepted {
             Ok(value) => value,
@@ -319,6 +333,7 @@ impl RendererSupervisor {
         &self,
         listener: &UnixListener,
         child: &mut Child,
+        renderer_id: RendererId,
         connect_timeout: Duration,
     ) -> io::Result<(UnixStream, RendererPrincipal)> {
         let deadline = Instant::now() + connect_timeout;
@@ -341,15 +356,8 @@ impl RendererSupervisor {
                         drop(stream);
                         continue;
                     }
-                    let instance = NEXT_RENDERER_INSTANCE
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                            current.checked_add(1)
-                        })
-                        .map_err(|_| io::Error::other("Renderer instance ID exhausted"))?;
-                    let id = RendererId::new(instance)
-                        .ok_or_else(|| io::Error::other("Renderer instance ID is zero"))?;
                     let principal = RendererPrincipal::new(
-                        id,
+                        renderer_id,
                         credentials.pid,
                         credentials.uid,
                         credentials.gid,
