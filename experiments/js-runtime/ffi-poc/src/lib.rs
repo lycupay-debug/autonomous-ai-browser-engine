@@ -3,13 +3,38 @@
 //! V8 is the selected runtime. SpiderMonkey remains available only as a
 //! comparison/fallback PoC until a future ADR changes that decision.
 
+/// Opaque, runtime-scoped identifier for an isolated JavaScript Realm.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct JsRealmId {
+    runtime_id: u64,
+    realm_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum JsValue {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Unsupported,
+}
+
 /// Project-owned JavaScript Runtime boundary. Implementations must not expose
-/// engine-specific handles or types. The initial Phase 0 contract deliberately
-/// supports stringified evaluation and explicit host checkpoints only; typed
-/// values, callbacks, realms, and browser-agent scheduling are later work.
+/// engine-specific handles or types. The Phase 0 contract supports typed
+/// primitive results, stringified evaluation, and explicit host checkpoints.
+/// Object handles, callbacks, and browser-agent scheduling remain later work.
 ///
 /// No `Send` or `Sync` bound is imposed: the selected V8 isolate is thread-affine.
 pub trait JsRuntime {
+    fn create_realm(&mut self) -> Result<JsRealmId, JsRuntimeError>;
+    fn destroy_realm(&mut self, realm: JsRealmId) -> Result<(), JsRuntimeError>;
+    fn evaluate_value_in_realm(
+        &mut self,
+        realm: JsRealmId,
+        source: &str,
+    ) -> Result<JsValue, JsRuntimeError>;
+    fn evaluate_value(&mut self, source: &str) -> Result<JsValue, JsRuntimeError>;
     fn evaluate_to_string(&mut self, source: &str) -> Result<String, JsRuntimeError>;
     fn microtask_checkpoint(&mut self) -> Result<(), JsRuntimeError>;
     fn collect_garbage(&mut self) -> Result<(), JsRuntimeError>;
@@ -40,12 +65,53 @@ mod native {
     use std::marker::PhantomData;
     use std::ptr::NonNull;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn allocate_runtime_id() -> Option<u64> {
+        NEXT_RUNTIME_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+    }
+
+    const JS_VALUE_TAG_UNDEFINED: c_int = 0;
+    const JS_VALUE_TAG_NULL: c_int = 1;
+    const JS_VALUE_TAG_BOOLEAN: c_int = 2;
+    const JS_VALUE_TAG_NUMBER: c_int = 3;
+    const JS_VALUE_TAG_STRING: c_int = 4;
+    const JS_VALUE_TAG_UNSUPPORTED: c_int = 5;
 
     unsafe extern "C" {
         fn aibe_v8_create() -> *mut c_void;
         fn aibe_v8_eval(
             handle: *mut c_void,
             source: *const c_char,
+            output: *mut c_char,
+            capacity: usize,
+            output_length: *mut usize,
+        ) -> c_int;
+        fn aibe_v8_create_realm(handle: *mut c_void, realm_id: *mut u64) -> c_int;
+        fn aibe_v8_destroy_realm(handle: *mut c_void, realm_id: u64) -> c_int;
+        fn aibe_v8_eval_value_in_realm(
+            handle: *mut c_void,
+            realm_id: u64,
+            source: *const c_char,
+            value_tag: *mut c_int,
+            boolean_value: *mut c_int,
+            number_value: *mut f64,
+            output: *mut c_char,
+            capacity: usize,
+            output_length: *mut usize,
+        ) -> c_int;
+        fn aibe_v8_eval_value(
+            handle: *mut c_void,
+            source: *const c_char,
+            value_tag: *mut c_int,
+            boolean_value: *mut c_int,
+            number_value: *mut f64,
             output: *mut c_char,
             capacity: usize,
             output_length: *mut usize,
@@ -70,6 +136,7 @@ mod native {
     /// and destruction must remain on the thread that created the instance.
     pub struct V8Runtime {
         handle: NonNull<c_void>,
+        runtime_id: u64,
         _thread_affinity: PhantomData<Rc<()>>,
     }
 
@@ -83,12 +150,138 @@ mod native {
 
     impl V8Runtime {
         pub fn new() -> Result<Self, &'static str> {
+            let runtime_id = allocate_runtime_id().ok_or("V8 runtime identity space exhausted")?;
             NonNull::new(unsafe { aibe_v8_create() })
                 .map(|handle| Self {
                     handle,
+                    runtime_id,
                     _thread_affinity: PhantomData,
                 })
                 .ok_or("V8 initialization failed")
+        }
+
+        pub fn create_realm(&mut self) -> Result<super::JsRealmId, super::JsRuntimeError> {
+            let mut realm_id = 0_u64;
+            let status = unsafe { aibe_v8_create_realm(self.handle.as_ptr(), &mut realm_id) };
+            if status == 0 && realm_id != 0 {
+                Ok(super::JsRealmId {
+                    runtime_id: self.runtime_id,
+                    realm_id,
+                })
+            } else {
+                Err(super::JsRuntimeError {
+                    code: if status == 0 { -13 } else { status },
+                })
+            }
+        }
+
+        pub fn destroy_realm(
+            &mut self,
+            realm: super::JsRealmId,
+        ) -> Result<(), super::JsRuntimeError> {
+            if realm.runtime_id != self.runtime_id {
+                return Err(super::JsRuntimeError { code: -14 });
+            }
+            let status = unsafe { aibe_v8_destroy_realm(self.handle.as_ptr(), realm.realm_id) };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(status.into())
+            }
+        }
+
+        pub fn eval_value_in_realm(
+            &mut self,
+            realm: super::JsRealmId,
+            source: &str,
+        ) -> Result<super::JsValue, super::JsRuntimeError> {
+            if realm.runtime_id != self.runtime_id {
+                return Err(super::JsRuntimeError { code: -14 });
+            }
+            let source = CString::new(source).map_err(|_| super::JsRuntimeError { code: -10 })?;
+            let mut value_tag = -1;
+            let mut boolean_value = 0;
+            let mut number_value = 0.0;
+            let mut output = vec![0_u8; 1024 * 1024];
+            let mut output_length = 0;
+            let status = unsafe {
+                aibe_v8_eval_value_in_realm(
+                    self.handle.as_ptr(),
+                    realm.realm_id,
+                    source.as_ptr(),
+                    &mut value_tag,
+                    &mut boolean_value,
+                    &mut number_value,
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    &mut output_length,
+                )
+            };
+            Self::decode_value_result(
+                status,
+                value_tag,
+                boolean_value,
+                number_value,
+                output,
+                output_length,
+            )
+            .map_err(Into::into)
+        }
+
+        fn decode_value_result(
+            status: i32,
+            value_tag: c_int,
+            boolean_value: c_int,
+            number_value: f64,
+            output: Vec<u8>,
+            output_length: usize,
+        ) -> Result<super::JsValue, i32> {
+            if status != 0 {
+                return Err(status);
+            }
+            if output_length > output.len() {
+                return Err(-11);
+            }
+            match value_tag {
+                JS_VALUE_TAG_UNDEFINED => Ok(super::JsValue::Undefined),
+                JS_VALUE_TAG_NULL => Ok(super::JsValue::Null),
+                JS_VALUE_TAG_BOOLEAN => Ok(super::JsValue::Boolean(boolean_value != 0)),
+                JS_VALUE_TAG_NUMBER => Ok(super::JsValue::Number(number_value)),
+                JS_VALUE_TAG_STRING => String::from_utf8(output[..output_length].to_vec())
+                    .map(super::JsValue::String)
+                    .map_err(|_| -12),
+                JS_VALUE_TAG_UNSUPPORTED => Ok(super::JsValue::Unsupported),
+                _ => Err(-13),
+            }
+        }
+
+        pub fn eval_value(&mut self, source: &str) -> Result<super::JsValue, i32> {
+            let source = CString::new(source).map_err(|_| -10)?;
+            let mut value_tag = -1;
+            let mut boolean_value = 0;
+            let mut number_value = 0.0;
+            let mut output = vec![0_u8; 1024 * 1024];
+            let mut output_length = 0;
+            let status = unsafe {
+                aibe_v8_eval_value(
+                    self.handle.as_ptr(),
+                    source.as_ptr(),
+                    &mut value_tag,
+                    &mut boolean_value,
+                    &mut number_value,
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    &mut output_length,
+                )
+            };
+            Self::decode_value_result(
+                status,
+                value_tag,
+                boolean_value,
+                number_value,
+                output,
+                output_length,
+            )
         }
 
         pub fn eval(&mut self, source: &str) -> Result<String, i32> {
@@ -136,6 +329,29 @@ mod native {
     }
 
     impl super::JsRuntime for V8Runtime {
+        fn create_realm(&mut self) -> Result<super::JsRealmId, super::JsRuntimeError> {
+            V8Runtime::create_realm(self)
+        }
+
+        fn destroy_realm(&mut self, realm: super::JsRealmId) -> Result<(), super::JsRuntimeError> {
+            V8Runtime::destroy_realm(self, realm)
+        }
+
+        fn evaluate_value_in_realm(
+            &mut self,
+            realm: super::JsRealmId,
+            source: &str,
+        ) -> Result<super::JsValue, super::JsRuntimeError> {
+            V8Runtime::eval_value_in_realm(self, realm, source)
+        }
+
+        fn evaluate_value(
+            &mut self,
+            source: &str,
+        ) -> Result<super::JsValue, super::JsRuntimeError> {
+            self.eval_value(source).map_err(Into::into)
+        }
+
         fn evaluate_to_string(&mut self, source: &str) -> Result<String, super::JsRuntimeError> {
             self.eval(source).map_err(Into::into)
         }
@@ -201,14 +417,161 @@ mod tests {
                 .expect("project Runtime contract evaluates")
         }
 
+        fn verify_realm_through_project_contract(runtime: &mut dyn JsRuntime) {
+            let realm = runtime
+                .create_realm()
+                .expect("project contract creates Realm");
+            assert_eq!(
+                runtime
+                    .evaluate_value_in_realm(realm, "6 * 7")
+                    .expect("project contract evaluates in Realm"),
+                super::JsValue::Number(42.0)
+            );
+            runtime
+                .destroy_realm(realm)
+                .expect("project contract destroys Realm");
+        }
+
         let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
         assert_eq!(evaluate_through_project_contract(&mut runtime), "42");
+        assert_eq!(
+            runtime
+                .evaluate_value("6 * 7")
+                .expect("typed primitive result"),
+            super::JsValue::Number(42.0)
+        );
+        verify_realm_through_project_contract(&mut runtime);
         runtime
             .microtask_checkpoint()
             .expect("project contract performs microtask checkpoint");
         runtime
             .collect_garbage()
             .expect("project contract collects garbage");
+    }
+
+    #[test]
+    fn v8_typed_primitive_values_preserve_javascript_types() {
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        assert_eq!(
+            runtime.eval_value("undefined").unwrap(),
+            super::JsValue::Undefined
+        );
+        assert_eq!(runtime.eval_value("null").unwrap(), super::JsValue::Null);
+        assert_eq!(
+            runtime.eval_value("true").unwrap(),
+            super::JsValue::Boolean(true)
+        );
+        assert_eq!(
+            runtime.eval_value("false").unwrap(),
+            super::JsValue::Boolean(false)
+        );
+        assert_eq!(
+            runtime.eval_value("1.25").unwrap(),
+            super::JsValue::Number(1.25)
+        );
+        assert_eq!(
+            runtime.eval_value("'A\\u0000B'").unwrap(),
+            super::JsValue::String("A\0B".to_string())
+        );
+        assert_eq!(
+            runtime.eval_value("({ value: 1 })").unwrap(),
+            super::JsValue::Unsupported
+        );
+        assert_eq!(
+            runtime.eval_value("1n").unwrap(),
+            super::JsValue::Unsupported
+        );
+        assert_eq!(
+            runtime.eval_value("Symbol('x')").unwrap(),
+            super::JsValue::Unsupported
+        );
+        assert_eq!(
+            runtime.eval_value("(() => {})").unwrap(),
+            super::JsValue::Unsupported
+        );
+        assert_eq!(
+            runtime.eval_value("''").unwrap(),
+            super::JsValue::String(String::new())
+        );
+        assert_eq!(runtime.eval_value("function (").unwrap_err(), -3);
+        assert_eq!(
+            runtime
+                .eval_value("throw new Error('typed failure')")
+                .unwrap_err(),
+            -4
+        );
+        match runtime.eval_value("-0").unwrap() {
+            super::JsValue::Number(value) => {
+                assert_eq!(value.to_bits(), (-0.0_f64).to_bits())
+            }
+            other => panic!("expected Number(-0), received {other:?}"),
+        }
+        assert!(matches!(
+            runtime.eval_value("NaN").unwrap(),
+            super::JsValue::Number(value) if value.is_nan()
+        ));
+    }
+
+    #[test]
+    fn v8_realms_are_isolated_and_destroyed_by_opaque_runtime_scoped_ids() {
+        use super::JsRuntime;
+
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let first = runtime.create_realm().expect("first realm is created");
+        let second = runtime.create_realm().expect("second realm is created");
+        assert_ne!(first, second);
+
+        let mut other_runtime = V8Runtime::new().expect("second runtime initializes");
+        assert_eq!(
+            other_runtime
+                .eval_value_in_realm(first, "1 + 1")
+                .unwrap_err()
+                .code,
+            -14
+        );
+        assert_eq!(other_runtime.destroy_realm(first).unwrap_err().code, -14);
+
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(first, "globalThis.privateValue = 41; privateValue")
+                .unwrap(),
+            super::JsValue::Number(41.0)
+        );
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(second, "typeof privateValue")
+                .unwrap(),
+            super::JsValue::String("undefined".to_string())
+        );
+        assert_eq!(
+            runtime.evaluate_value("typeof privateValue").unwrap(),
+            super::JsValue::String("undefined".to_string())
+        );
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(first, "privateValue + 1")
+                .unwrap(),
+            super::JsValue::Number(42.0)
+        );
+
+        runtime
+            .destroy_realm(first)
+            .expect("first realm is destroyed");
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(first, "1 + 1")
+                .unwrap_err()
+                .code,
+            -9
+        );
+        assert_eq!(
+            runtime.evaluate_value_in_realm(second, "6 * 7").unwrap(),
+            super::JsValue::Number(42.0)
+        );
+        runtime
+            .destroy_realm(second)
+            .expect("second realm is destroyed");
+        assert_eq!(runtime.destroy_realm(second).unwrap_err().code, -9);
     }
 
     #[test]

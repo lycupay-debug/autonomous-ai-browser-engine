@@ -76,6 +76,9 @@ struct AibeV8Runtime {
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
     v8::Isolate* isolate = nullptr;
     v8::Global<v8::Context> context;
+    // Additional isolated V8 Contexts are addressed by opaque monotonic IDs.
+    std::unordered_map<uint64_t, v8::Global<v8::Context>> realms;
+    uint64_t next_realm_id = 1;
     std::thread::id owner_thread;
     v8::Global<v8::FunctionTemplate> node_template;
     // Weak per-runtime identity cache: it must not keep JS wrappers alive.
@@ -696,6 +699,201 @@ extern "C" int aibe_v8_eval(
     return 0;
 }
 
+enum AibeJsValueTag : int {
+    AIBE_JS_VALUE_TAG_UNDEFINED = 0,
+    AIBE_JS_VALUE_TAG_NULL = 1,
+    AIBE_JS_VALUE_TAG_BOOLEAN = 2,
+    AIBE_JS_VALUE_TAG_NUMBER = 3,
+    AIBE_JS_VALUE_TAG_STRING = 4,
+    AIBE_JS_VALUE_TAG_UNSUPPORTED = 5,
+};
+
+static int aibe_v8_eval_value_in_context(
+    AibeV8Runtime* runtime,
+    v8::Local<v8::Context> context,
+    const char* source,
+    int* value_tag,
+    int* boolean_value,
+    double* number_value,
+    char* output,
+    size_t capacity,
+    size_t* output_length)
+{
+    if (runtime == nullptr || source == nullptr || value_tag == nullptr
+        || boolean_value == nullptr || number_value == nullptr
+        || output == nullptr || output_length == nullptr) {
+        return -1;
+    }
+    *value_tag = -1;
+    *boolean_value = 0;
+    *number_value = 0.0;
+    *output_length = 0;
+    if (context.IsEmpty()) {
+        return -8;
+    }
+
+    v8::Context::Scope context_scope(context);
+    PendingNodeReleaseScope pending_release_scope{runtime};
+    v8::TryCatch try_catch(runtime->isolate);
+
+    v8::Local<v8::String> text;
+    if (!v8::String::NewFromUtf8(
+             runtime->isolate, source, v8::NewStringType::kNormal).ToLocal(&text)) {
+        return -2;
+    }
+    v8::Local<v8::Script> script;
+    if (!v8::Script::Compile(context, text).ToLocal(&script)) {
+        return -3;
+    }
+    v8::Local<v8::Value> value;
+    if (!script->Run(context).ToLocal(&value)) {
+        return -4;
+    }
+
+    if (value->IsUndefined()) {
+        *value_tag = AIBE_JS_VALUE_TAG_UNDEFINED;
+    } else if (value->IsNull()) {
+        *value_tag = AIBE_JS_VALUE_TAG_NULL;
+    } else if (value->IsBoolean()) {
+        *value_tag = AIBE_JS_VALUE_TAG_BOOLEAN;
+        *boolean_value = value->BooleanValue(runtime->isolate) ? 1 : 0;
+    } else if (value->IsNumber()) {
+        *value_tag = AIBE_JS_VALUE_TAG_NUMBER;
+        *number_value = value.As<v8::Number>()->Value();
+    } else if (value->IsString()) {
+        *value_tag = AIBE_JS_VALUE_TAG_STRING;
+        v8::String::Utf8Value utf8(runtime->isolate, value);
+        if (*utf8 == nullptr || utf8.length() < 0) {
+            return -5;
+        }
+        const size_t length = static_cast<size_t>(utf8.length());
+        if (length > capacity) {
+            return -6;
+        }
+        std::memcpy(output, *utf8, length);
+        *output_length = length;
+    } else {
+        // Objects, functions, symbols, and BigInts require explicit project
+        // handles or dedicated representations; never coerce them implicitly.
+        *value_tag = AIBE_JS_VALUE_TAG_UNSUPPORTED;
+    }
+    return 0;
+}
+
+static int aibe_v8_eval_value_for_realm(
+    void* opaque,
+    uint64_t realm_id,
+    const char* source,
+    int* value_tag,
+    int* boolean_value,
+    double* number_value,
+    char* output,
+    size_t capacity,
+    size_t* output_length)
+{
+    if (opaque == nullptr) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+
+    auto found = runtime->realms.find(realm_id);
+    if (found == runtime->realms.end()) {
+        return -9;
+    }
+    return aibe_v8_eval_value_in_context(
+        runtime, found->second.Get(runtime->isolate), source,
+        value_tag, boolean_value, number_value, output, capacity, output_length);
+}
+
+extern "C" int aibe_v8_eval_value(
+    void* opaque,
+    const char* source,
+    int* value_tag,
+    int* boolean_value,
+    double* number_value,
+    char* output,
+    size_t capacity,
+    size_t* output_length)
+{
+    if (opaque == nullptr) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+    return aibe_v8_eval_value_in_context(
+        runtime, runtime->context.Get(runtime->isolate), source,
+        value_tag, boolean_value, number_value, output, capacity, output_length);
+}
+
+extern "C" int aibe_v8_create_realm(void* opaque, uint64_t* realm_id)
+{
+    if (opaque == nullptr || realm_id == nullptr) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+    auto context = v8::Context::New(runtime->isolate);
+    if (context.IsEmpty()) {
+        return -8;
+    }
+    if (runtime->next_realm_id == 0 || runtime->next_realm_id == UINT64_MAX) {
+        return -10;
+    }
+    const uint64_t id = runtime->next_realm_id++;
+    v8::Global<v8::Context> persistent(runtime->isolate, context);
+    runtime->realms.emplace(id, std::move(persistent));
+    *realm_id = id;
+    return 0;
+}
+
+extern "C" int aibe_v8_destroy_realm(void* opaque, uint64_t realm_id)
+{
+    if (opaque == nullptr || realm_id == 0) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    auto found = runtime->realms.find(realm_id);
+    if (found == runtime->realms.end()) {
+        return -9;
+    }
+    found->second.Reset();
+    runtime->realms.erase(found);
+    return 0;
+}
+
+extern "C" int aibe_v8_eval_value_in_realm(
+    void* opaque,
+    uint64_t realm_id,
+    const char* source,
+    int* value_tag,
+    int* boolean_value,
+    double* number_value,
+    char* output,
+    size_t capacity,
+    size_t* output_length)
+{
+    return aibe_v8_eval_value_for_realm(
+        opaque, realm_id, source, value_tag, boolean_value,
+        number_value, output, capacity, output_length);
+}
+
 extern "C" int aibe_v8_run_microtasks(void* opaque)
 {
     if (opaque == nullptr) {
@@ -788,6 +986,10 @@ extern "C" int aibe_v8_destroy(void* opaque)
     {
         v8::Isolate::Scope isolate_scope(runtime->isolate);
         drain_pending_node_releases(runtime);
+        for (auto& realm : runtime->realms) {
+            realm.second.Reset();
+        }
+        runtime->realms.clear();
         runtime->context.Reset();
         runtime->node_template.Reset();
         for (const auto& entry : runtime->node_wrappers) {
