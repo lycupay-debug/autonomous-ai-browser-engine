@@ -10,6 +10,14 @@ pub struct JsRealmId {
     realm_id: u64,
 }
 
+/// Opaque, host-issued origin-group identifier. It is not a URL or origin string.
+/// Only Realms explicitly created with the same handle share host-object access.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct JsOriginId {
+    runtime_id: u64,
+    origin_id: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum JsValue {
     Undefined,
@@ -28,7 +36,9 @@ pub enum JsValue {
 ///
 /// No `Send` or `Sync` bound is imposed: the selected V8 isolate is thread-affine.
 pub trait JsRuntime {
+    fn create_origin(&mut self) -> Result<JsOriginId, JsRuntimeError>;
     fn create_realm(&mut self) -> Result<JsRealmId, JsRuntimeError>;
+    fn create_realm_for_origin(&mut self, origin: JsOriginId) -> Result<JsRealmId, JsRuntimeError>;
     fn destroy_realm(&mut self, realm: JsRealmId) -> Result<(), JsRuntimeError>;
     fn evaluate_value_in_realm(
         &mut self,
@@ -223,7 +233,14 @@ mod native {
             capacity: usize,
             output_length: *mut usize,
         ) -> c_int;
-        fn aibe_v8_create_realm(handle: *mut c_void, realm_id: *mut u64) -> c_int;
+        fn aibe_v8_create_realm(handle: *mut c_void, origin_id: u64, realm_id: *mut u64) -> c_int;
+        #[cfg(test)]
+        fn aibe_v8_origin_access_probe(
+            handle: *mut c_void,
+            source_realm_id: u64,
+            same_origin_realm_id: u64,
+            cross_origin_realm_id: u64,
+        ) -> c_int;
         fn aibe_v8_destroy_realm(handle: *mut c_void, realm_id: u64) -> c_int;
         fn aibe_v8_install_host_callback(
             handle: *mut c_void,
@@ -296,6 +313,7 @@ mod native {
     pub struct V8Runtime {
         handle: NonNull<c_void>,
         runtime_id: u64,
+        next_origin_id: u64,
         host_callback_state: Option<Box<HostCallbackState>>,
         host_callback_realm_id: Option<u64>,
         _thread_affinity: PhantomData<Rc<()>>,
@@ -316,6 +334,7 @@ mod native {
                 .map(|handle| Self {
                     handle,
                     runtime_id,
+                    next_origin_id: 1,
                     host_callback_state: None,
                     host_callback_realm_id: None,
                     _thread_affinity: PhantomData,
@@ -323,9 +342,32 @@ mod native {
                 .ok_or("V8 initialization failed")
         }
 
-        pub fn create_realm(&mut self) -> Result<super::JsRealmId, super::JsRuntimeError> {
+        /// Creates a host-issued origin group. The opaque ID must not be
+        /// derived from untrusted page-controlled URL or DOM data.
+        pub fn create_origin(&mut self) -> Result<super::JsOriginId, super::JsRuntimeError> {
+            if self.next_origin_id == 0 || self.next_origin_id == u64::MAX {
+                return Err((-16).into());
+            }
+            let origin_id = self.next_origin_id;
+            self.next_origin_id += 1;
+            Ok(super::JsOriginId {
+                runtime_id: self.runtime_id,
+                origin_id,
+            })
+        }
+
+        /// Creates a Realm with a host-issued origin-group capability.
+        pub fn create_realm_for_origin(
+            &mut self,
+            origin: super::JsOriginId,
+        ) -> Result<super::JsRealmId, super::JsRuntimeError> {
+            if origin.runtime_id != self.runtime_id {
+                return Err((-14).into());
+            }
             let mut realm_id = 0_u64;
-            let status = unsafe { aibe_v8_create_realm(self.handle.as_ptr(), &mut realm_id) };
+            let status = unsafe {
+                aibe_v8_create_realm(self.handle.as_ptr(), origin.origin_id, &mut realm_id)
+            };
             if status == 0 && realm_id != 0 {
                 Ok(super::JsRealmId {
                     runtime_id: self.runtime_id,
@@ -338,6 +380,12 @@ mod native {
                     status.into()
                 })
             }
+        }
+
+        /// Creates a Realm in a fresh, isolated origin group.
+        pub fn create_realm(&mut self) -> Result<super::JsRealmId, super::JsRuntimeError> {
+            let origin = self.create_origin()?;
+            self.create_realm_for_origin(origin)
         }
 
         pub fn destroy_realm(
@@ -583,6 +631,29 @@ mod native {
         }
 
         #[cfg(test)]
+        pub fn origin_access_probe(
+            &mut self,
+            source: super::JsRealmId,
+            same_origin: super::JsRealmId,
+            cross_origin: super::JsRealmId,
+        ) -> i32 {
+            if [source, same_origin, cross_origin]
+                .iter()
+                .any(|realm| realm.runtime_id != self.runtime_id)
+            {
+                return -14;
+            }
+            unsafe {
+                aibe_v8_origin_access_probe(
+                    self.handle.as_ptr(),
+                    source.realm_id,
+                    same_origin.realm_id,
+                    cross_origin.realm_id,
+                )
+            }
+        }
+
+        #[cfg(test)]
         pub fn realm_wrapper_cache_probe(
             &mut self,
             first: super::JsRealmId,
@@ -630,8 +701,19 @@ mod native {
     }
 
     impl super::JsRuntime for V8Runtime {
+        fn create_origin(&mut self) -> Result<super::JsOriginId, super::JsRuntimeError> {
+            V8Runtime::create_origin(self)
+        }
+
         fn create_realm(&mut self) -> Result<super::JsRealmId, super::JsRuntimeError> {
             V8Runtime::create_realm(self)
+        }
+
+        fn create_realm_for_origin(
+            &mut self,
+            origin: super::JsOriginId,
+        ) -> Result<super::JsRealmId, super::JsRuntimeError> {
+            V8Runtime::create_realm_for_origin(self, origin)
         }
 
         fn destroy_realm(&mut self, realm: super::JsRealmId) -> Result<(), super::JsRuntimeError> {
@@ -934,8 +1016,13 @@ mod tests {
     #[test]
     fn v8_realm_host_callback_function_cannot_be_transferred_to_another_realm() {
         let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
-        let granted_realm = runtime.create_realm().expect("grant Realm is created");
-        let caller_realm = runtime.create_realm().expect("caller Realm is created");
+        let shared_origin = runtime.create_origin().expect("host issues shared origin");
+        let granted_realm = runtime
+            .create_realm_for_origin(shared_origin)
+            .expect("grant Realm is created");
+        let caller_realm = runtime
+            .create_realm_for_origin(shared_origin)
+            .expect("same-origin caller Realm is created");
         runtime
             .install_host_callback(granted_realm, |_| Ok("must not be called".to_string()))
             .expect("host callback is granted only to the selected Realm");
@@ -976,6 +1063,38 @@ mod tests {
                 .eval_value_in_realm(realm, "hostCall('outer')")
                 .unwrap(),
             super::JsValue::String("-3:reentrant host callback rejected".to_string())
+        );
+    }
+
+    #[test]
+    fn v8_host_object_access_is_shared_only_by_realms_with_same_host_origin() {
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let origin_a = runtime.create_origin().expect("origin A is issued by host");
+        let origin_b = runtime.create_origin().expect("origin B is issued by host");
+        let source = runtime
+            .create_realm_for_origin(origin_a)
+            .expect("source Realm created");
+        let same_origin = runtime
+            .create_realm_for_origin(origin_a)
+            .expect("same-origin Realm created");
+        let cross_origin = runtime
+            .create_realm_for_origin(origin_b)
+            .expect("cross-origin Realm created");
+
+        assert_eq!(
+            runtime.origin_access_probe(source, same_origin, cross_origin),
+            0,
+            "a native DOM wrapper may be used in another Realm only when the host grants the same origin group"
+        );
+
+        let mut other_runtime = V8Runtime::new().expect("independent Runtime initializes");
+        assert_eq!(
+            other_runtime
+                .create_realm_for_origin(origin_a)
+                .unwrap_err()
+                .code,
+            -14,
+            "an origin capability from another Runtime must be rejected"
         );
     }
 

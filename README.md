@@ -6,6 +6,8 @@ A FreeBSD-native, AI-first browser engine research and development project.
 
 This repository is in **Phase 0: technical feasibility research**. It is not a usable browser and does not claim Web compatibility. The project owner has selected V8 15.6.75.19 as the primary JavaScript Runtime; Phase 0 still has open security and integration exit conditions.
 
+The current V8 FFI PoC models host-issued origin groups separately from JavaScript Realms. Same-origin Realms can use a transferred native DOM wrapper; cross-origin access is rejected at the native wrapper boundary. This is a narrow in-process host-object policy experiment, not a complete web-origin implementation, site-isolation architecture, or Renderer Sandbox. See `docs/phase-0/README.md` for evidence and limitations.
+
 ## Principles
 
 - FreeBSD is the first native target.

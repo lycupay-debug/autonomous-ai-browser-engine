@@ -220,3 +220,43 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - Destroying the granted Realm clears the native callback pointer before the Rust-owned callback state is released. A replacement Realm can then receive a new callback grant.
 - FreeBSD V8 FFI tests: 20/20; workspace tests: 57/57. All four host-callback tests (capability scope/UTF-8, error and panic conversion, reentrant dispatch rejection, and cross-Realm function-transfer rejection) passed 20/20 independent test-process runs each. `cargo fmt --all -- --check`, Clippy with `-D warnings`, and `git diff --check` passed.
 - Reentrancy scope: the current test recursively enters the Rust FFI dispatcher and proves the guard; it does not yet validate nested V8 script execution from inside a host callback. Async/Promise callbacks, cancellation/deadlines, structured-clone arguments, multi-capability registries, and a full Origin/agent security-token model remain open. This is a feasibility contract, not a production host-permission system.
+
+
+## Origin-grouped DOM wrapper access — 2026-11-01
+
+### Objective
+
+Separate JavaScript Realm identity from the host's same-origin grouping decision. A Realm is an execution environment; an origin group is an explicit host authorization boundary for native DOM wrapper access. Host callbacks remain scoped to one exact Realm and must not become transferable merely because two Realms share an origin group.
+
+### Implementation
+
+- Added opaque `JsOriginId`, scoped to its owning `JsRuntime`; the Rust adapter issues monotonically increasing IDs and rejects handles from another Runtime.
+- Added `create_origin()` and `create_realm_for_origin()`. The existing `create_realm()` creates a fresh origin group, preserving isolation by default.
+- Passed the origin-group ID across the narrow C ABI and stored it separately from the Realm ID in V8 Context embedder data.
+- DOM wrapper cache identity remains `(native Node identity, Realm ID)`, so wrapper identity is still per-Realm.
+- Each native wrapper records its host origin-group ID. Native wrapper entry checks both V8's current Context and incumbent Context against the wrapper's origin group.
+- `appendChild` and `removeChild` accept nodes from another Realm only when the host origin group matches; different-origin wrappers are rejected at the native entry point.
+- Strengthened the host-callback transfer test: the grant Realm and caller Realm deliberately share an origin group, but transferring `hostCall` still fails because the callback capability is tied to the exact granted Realm.
+
+### Verification
+
+- Focused same-origin/cross-origin DOM wrapper test: 20/20 independent test-process runs passed on FreeBSD 15.1-RELEASE-p6.
+- Full FreeBSD workspace: 58 tests passed, 0 failed (Boa 7, UDS 9, Headless 4, V8 FFI 21, Network 17).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed.
+- `git diff --check`: passed.
+
+### Evidence boundary and limitations
+
+- This verifies an embedder-enforced origin-group check for this native Node wrapper PoC. It does not prove general JavaScript object isolation: ordinary JS objects are not automatically protected by this wrapper check.
+- `JsOriginId` is an internal host-issued grouping handle, not a URL origin parser or cryptographic security principal. Do not derive or grant it from untrusted page input.
+- URL scheme/host/port computation, opaque origins, sandboxed frames, `document.domain`, agent clusters, structured clone, `postMessage`, cross-origin DOM access semantics, and process/site isolation remain unimplemented.
+- The earlier V8 `Context::SetSecurityToken` experiments did not establish the required same-token Global Proxy behavior. This implementation does not claim that V8 security tokens alone enforce the browser's origin policy.
+- This remains a Phase 0 feasibility PoC. It is not production DOM, a complete same-origin policy, or a Renderer Sandbox.
+
+### Next work
+
+1. Add a formal host-owned Origin model and URL-origin canonicalization tests before mapping real page URLs to origin groups.
+2. Test hostile wrapper transfer, nested callbacks, event listeners, and stale wrappers after Realm destruction.
+3. Define Document/Frame/Agent ownership and decide which origin-group handles may be shared across contexts/processes.
+4. Continue the independent Renderer Sandbox work: process separation, Capsicum FD rights, Jail network denial, rctl, IPC authentication, and crash recovery.

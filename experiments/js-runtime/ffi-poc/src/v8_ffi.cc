@@ -71,6 +71,7 @@ struct AibeNodeWrapper {
     AibeV8Runtime* owner;
     std::shared_ptr<AibeNativeNode> node;
     uint64_t realm_id;
+    uint64_t origin_id;
     v8::Global<v8::Object> object;
     AibeNodeWrapper* pending_next = nullptr;
 };
@@ -120,7 +121,9 @@ struct AibeV8Runtime {
 
 namespace {
 constexpr int kAibeRealmEmbedderDataIndex = 1;
+constexpr int kAibeOriginEmbedderDataIndex = 2;
 constexpr uint64_t kInvalidRealmId = UINT64_MAX;
+constexpr uint64_t kInvalidOriginId = UINT64_MAX;
 
 uint64_t realm_id_from_context(v8::Local<v8::Context> context)
 {
@@ -139,6 +142,30 @@ uint64_t realm_id_from_context(v8::Local<v8::Context> context)
 uint64_t current_realm_id(v8::Isolate* isolate)
 {
     return realm_id_from_context(isolate->GetCurrentContext());
+}
+
+uint64_t origin_id_from_context(v8::Local<v8::Context> context)
+{
+    if (context.IsEmpty()) {
+        return kInvalidOriginId;
+    }
+    auto data = context->GetEmbedderData(kAibeOriginEmbedderDataIndex);
+    if (data.IsEmpty() || !data->IsBigInt()) {
+        return kInvalidOriginId;
+    }
+    bool lossless = false;
+    const auto origin_id = data.As<v8::BigInt>()->Uint64Value(&lossless);
+    return lossless ? origin_id : kInvalidOriginId;
+}
+
+uint64_t current_origin_id(v8::Isolate* isolate)
+{
+    return origin_id_from_context(isolate->GetCurrentContext());
+}
+
+uint64_t incumbent_origin_id(v8::Isolate* isolate)
+{
+    return origin_id_from_context(isolate->GetIncumbentContext());
 }
 
 std::atomic<size_t> g_finalized_dom_wrappers{0};
@@ -173,7 +200,8 @@ AibeNodeWrapper* node_wrapper_from(
     auto* wrapper = static_cast<AibeNodeWrapper*>(
         external.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
     if (wrapper == nullptr || wrapper->owner->isolate != isolate
-        || wrapper->realm_id != current_realm_id(isolate)) {
+        || wrapper->origin_id != current_origin_id(isolate)
+        || wrapper->origin_id != incumbent_origin_id(isolate)) {
         return nullptr;
     }
     return wrapper;
@@ -199,7 +227,11 @@ AibeNodeWrapper* attach_node_wrapper(
     uint64_t realm_id)
 {
     auto* isolate = runtime->isolate;
-    auto* wrapper = new AibeNodeWrapper{runtime, node, realm_id, {}};
+    const auto origin_id = current_origin_id(isolate);
+    if (origin_id == kInvalidOriginId) {
+        return nullptr;
+    }
+    auto* wrapper = new AibeNodeWrapper{runtime, node, realm_id, origin_id, {}};
     object->SetInternalField(
         0, v8::External::New(isolate, wrapper, v8::kExternalPointerTypeTagDefault));
     wrapper->object.Reset(isolate, object);
@@ -255,7 +287,12 @@ void node_constructor(const v8::FunctionCallbackInfo<v8::Value>& info)
         return;
     }
 
-    attach_node_wrapper(runtime, info.This(), std::make_shared<AibeNativeNode>(), realm_id);
+    if (attach_node_wrapper(runtime, info.This(), std::make_shared<AibeNativeNode>(), realm_id)
+        == nullptr) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "Node wrapper initialization failed")));
+        return;
+    }
     info.GetReturnValue().Set(info.This());
 }
 
@@ -270,7 +307,7 @@ void node_append_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     }
     auto* child = node_wrapper_from(isolate, info[0].As<v8::Object>());
     if (child == nullptr || child->owner != parent->owner
-        || child->realm_id != parent->realm_id) {
+        || child->origin_id != parent->origin_id) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "appendChild received an invalid Node")));
         return;
@@ -310,7 +347,7 @@ void node_remove_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     }
     auto* child = node_wrapper_from(isolate, info[0].As<v8::Object>());
     if (child == nullptr || child->owner != parent->owner
-        || child->realm_id != parent->realm_id) {
+        || child->origin_id != parent->origin_id) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "removeChild received an invalid Node")));
         return;
@@ -598,11 +635,14 @@ bool initialize_node_template(AibeV8Runtime* runtime)
 bool install_node_class(
     AibeV8Runtime* runtime,
     v8::Local<v8::Context> context,
-    uint64_t realm_id)
+    uint64_t realm_id,
+    uint64_t origin_id)
 {
     auto* isolate = runtime->isolate;
     context->SetEmbedderData(
         kAibeRealmEmbedderDataIndex, v8::BigInt::NewFromUnsigned(isolate, realm_id));
+    context->SetEmbedderData(
+        kAibeOriginEmbedderDataIndex, v8::BigInt::NewFromUnsigned(isolate, origin_id));
     auto node_template = runtime->node_template.Get(isolate);
     if (node_template.IsEmpty()) {
         return false;
@@ -815,7 +855,7 @@ extern "C" void* aibe_v8_create()
         }
         runtime->isolate->SetData(0, runtime.get());
         if (!initialize_node_template(runtime.get())
-            || !install_node_class(runtime.get(), context, 0)) {
+            || !install_node_class(runtime.get(), context, 0, 0)) {
             runtime->isolate->Dispose();
             runtime->isolate = nullptr;
             return nullptr;
@@ -1081,9 +1121,9 @@ extern "C" int aibe_v8_eval_value(
         error_line, error_column);
 }
 
-extern "C" int aibe_v8_create_realm(void* opaque, uint64_t* realm_id)
+extern "C" int aibe_v8_create_realm(void* opaque, uint64_t origin_id, uint64_t* realm_id)
 {
-    if (opaque == nullptr || realm_id == nullptr) {
+    if (opaque == nullptr || origin_id == 0 || origin_id == kInvalidOriginId || realm_id == nullptr) {
         return -1;
     }
     auto* runtime = static_cast<AibeV8Runtime*>(opaque);
@@ -1100,7 +1140,7 @@ extern "C" int aibe_v8_create_realm(void* opaque, uint64_t* realm_id)
         return -10;
     }
     const uint64_t id = runtime->next_realm_id++;
-    if (!install_node_class(runtime, context, id)) {
+    if (!install_node_class(runtime, context, id, origin_id)) {
         return -8;
     }
     v8::Global<v8::Context> persistent(runtime->isolate, context);
@@ -1289,6 +1329,97 @@ extern "C" int aibe_v8_realm_wrapper_cache_probe(
         }
         if (node_wrapper_from(runtime->isolate, second_wrapper) == nullptr) {
             return -14;
+        }
+    }
+    return 0;
+}
+
+// Test-only proof of host-enforced origin groups. V8 Context security tokens
+// alone are not treated as the authority for DOM access; the embedder checks
+// the host-issued origin ID on every native wrapper entry point.
+extern "C" int aibe_v8_origin_access_probe(
+    void* opaque, uint64_t source_realm_id, uint64_t same_origin_realm_id,
+    uint64_t cross_origin_realm_id)
+{
+    if (opaque == nullptr || source_realm_id == 0 || same_origin_realm_id == 0
+        || cross_origin_realm_id == 0 || source_realm_id == same_origin_realm_id
+        || source_realm_id == cross_origin_realm_id
+        || same_origin_realm_id == cross_origin_realm_id) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    auto source = runtime->realms.find(source_realm_id);
+    auto same = runtime->realms.find(same_origin_realm_id);
+    auto different = runtime->realms.find(cross_origin_realm_id);
+    if (source == runtime->realms.end() || same == runtime->realms.end()
+        || different == runtime->realms.end()) {
+        return -9;
+    }
+
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+    v8::Local<v8::Object> source_wrapper;
+    {
+        auto context = source->second.Get(runtime->isolate);
+        v8::Context::Scope context_scope(context);
+        if (!wrap_node(runtime, std::make_shared<AibeNativeNode>(), source_realm_id)
+                 .ToLocal(&source_wrapper)) {
+            return -10;
+        }
+    }
+
+    auto transfer = [&](v8::Local<v8::Context> context) -> bool {
+        v8::Context::Scope context_scope(context);
+        return context->Global()
+            ->DefineOwnProperty(
+                context, v8::String::NewFromUtf8Literal(runtime->isolate, "sharedNode"),
+                source_wrapper, v8::None)
+            .FromMaybe(false);
+    };
+    {
+        auto context = same->second.Get(runtime->isolate);
+        if (!transfer(context)) {
+            return -11;
+        }
+        v8::Context::Scope context_scope(context);
+        auto source_text = v8::String::NewFromUtf8Literal(
+            runtime->isolate,
+            "const localParent = new Node(); localParent.appendChild(sharedNode); "
+            "localParent.childCount() === 1 && sharedNode.childCount() === 0;");
+        v8::Local<v8::Script> script;
+        if (!v8::Script::Compile(context, source_text).ToLocal(&script)) {
+            return -12;
+        }
+        v8::Local<v8::Value> result;
+        if (!script->Run(context).ToLocal(&result) || !result->IsTrue()) {
+            return -13;
+        }
+    }
+    {
+        auto context = different->second.Get(runtime->isolate);
+        if (!transfer(context)) {
+            return -14;
+        }
+        v8::Context::Scope context_scope(context);
+        auto source_text = v8::String::NewFromUtf8Literal(
+            runtime->isolate,
+            "const localParent = new Node(); "
+            "try { localParent.appendChild(sharedNode); 'unexpected'; } "
+            "catch (error) { error.name === 'TypeError' ? 'blocked' : 'wrong-error'; }");
+        v8::Local<v8::Script> script;
+        if (!v8::Script::Compile(context, source_text).ToLocal(&script)) {
+            return -15;
+        }
+        v8::Local<v8::Value> result;
+        if (!script->Run(context).ToLocal(&result) || !result->IsString()) {
+            return -16;
+        }
+        v8::String::Utf8Value message(runtime->isolate, result);
+        if (*message == nullptr || std::string(*message, message.length()) != "blocked") {
+            return -17;
         }
     }
     return 0;
