@@ -19,6 +19,9 @@ dependencies = [
 [[package]]
 name = "aibe-broker-policy-poc"
 version = "0.1.0"
+dependencies = [
+ "aibe-origin-policy-poc",
+]
 
 [[package]]
 name = "aibe-browser-runtime-origin-poc"
@@ -35,6 +38,7 @@ name = "aibe-control-protocol-uds-poc"
 version = "0.1.0"
 dependencies = [
  "aibe-broker-policy-poc",
+ "aibe-origin-policy-poc",
  "serde_json",
 ]
 
@@ -77,6 +81,17 @@ name = "aibe-origin-policy-poc"
 version = "0.1.0"
 dependencies = [
  "url",
+]
+
+[[package]]
+name = "aibe-snapshot-bridge-poc"
+version = "0.1.0"
+dependencies = [
+ "aibe-broker-policy-poc",
+ "aibe-browser-runtime-origin-poc",
+ "aibe-control-protocol-uds-poc",
+ "aibe-origin-policy-poc",
+ "serde_json",
 ]
 
 [[package]]

@@ -7,6 +7,8 @@
 //! Broker-owned process/socketpair and execute TerminateRenderer outcomes.
 
 use std::collections::HashMap;
+
+use aibe_origin_policy_poc::OriginGroupId as HostOriginGroupId;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -440,7 +442,7 @@ impl std::error::Error for SnapshotGrantError {}
 #[derive(Clone, Copy, Debug)]
 struct SnapshotGrantRecord {
     renderer: RendererPrincipal,
-    origin: OriginGroupId,
+    origin: HostOriginGroupId,
     document_id: u64,
     revision: u64,
     consumed: bool,
@@ -482,7 +484,7 @@ impl SnapshotGrantRegistry {
     pub fn issue(
         &mut self,
         renderer: RendererPrincipal,
-        origin: OriginGroupId,
+        origin: HostOriginGroupId,
         document_id: u64,
         revision: u64,
     ) -> Result<SnapshotGrantId, SnapshotGrantError> {
@@ -526,7 +528,7 @@ impl SnapshotGrantRegistry {
         &mut self,
         id: SnapshotGrantId,
         renderer: RendererPrincipal,
-        origin: OriginGroupId,
+        origin: HostOriginGroupId,
         document_id: u64,
         revision: u64,
     ) -> Result<(), SnapshotGrantError> {
@@ -594,6 +596,7 @@ impl SnapshotGrantRegistry {
 
 #[cfg(test)]
 mod tests {
+    use super::HostOriginGroupId;
     use super::{
         GRANT_WIRE_DESCRIPTOR_COUNT, GRANT_WIRE_MAGIC, GRANT_WIRE_VERSION, GrantError,
         GrantRegistry, GrantState, GrantWireHeader, OriginGroupId, RendererId, RendererPrincipal,
@@ -606,6 +609,13 @@ mod tests {
 
     fn origin(id: u64) -> OriginGroupId {
         OriginGroupId::new(id).unwrap()
+    }
+
+    fn snapshot_origin(id: u64) -> HostOriginGroupId {
+        let mut registry = aibe_origin_policy_poc::OriginRegistry::new().unwrap();
+        registry
+            .resolve_url(&format!("https://snapshot-{id}.example/"))
+            .unwrap()
     }
 
     fn registry() -> GrantRegistry {
@@ -892,7 +902,7 @@ mod tests {
     fn snapshot_grant_binds_renderer_origin_document_and_revision_once() {
         use super::{SnapshotGrantError, SnapshotGrantRegistry};
         let owner = renderer(91, 8191);
-        let origin_id = origin(77);
+        let origin_id = snapshot_origin(77);
         let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
         let grant = grants.issue(owner, origin_id, 7001, 4).unwrap();
         grants.authorize(grant, owner, origin_id, 7001, 4).unwrap();
@@ -911,7 +921,7 @@ mod tests {
         use super::{SnapshotGrantError, SnapshotGrantRegistry};
         let owner = renderer(91, 8191);
         let replacement_instance = renderer(92, 8191);
-        let origin_id = origin(77);
+        let origin_id = snapshot_origin(77);
         let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
         let grant = grants.issue(owner, origin_id, 7001, 4).unwrap();
         assert_eq!(
@@ -919,7 +929,7 @@ mod tests {
             Err(SnapshotGrantError::WrongRenderer)
         );
         assert_eq!(
-            grants.authorize(grant, owner, origin(78), 7001, 4),
+            grants.authorize(grant, owner, snapshot_origin(78), 7001, 4),
             Err(SnapshotGrantError::WrongOrigin)
         );
         assert_eq!(
@@ -939,22 +949,22 @@ mod tests {
         let first = renderer(91, 8191);
         let second = renderer(92, 8192);
         let mut grants = SnapshotGrantRegistry::new(2, 1).unwrap();
-        let first_grant = grants.issue(first, origin(77), 7001, 1).unwrap();
+        let first_grant = grants.issue(first, snapshot_origin(77), 7001, 1).unwrap();
         assert_eq!(
-            grants.issue(first, origin(77), 7002, 1),
+            grants.issue(first, snapshot_origin(77), 7002, 1),
             Err(SnapshotGrantError::QuotaExceeded(
                 super::QuotaScope::PerRenderer
             ))
         );
-        grants.issue(second, origin(78), 7003, 1).unwrap();
+        grants.issue(second, snapshot_origin(78), 7003, 1).unwrap();
         assert_eq!(
-            grants.issue(renderer(93, 8193), origin(79), 7004, 1),
+            grants.issue(renderer(93, 8193), snapshot_origin(79), 7004, 1),
             Err(SnapshotGrantError::QuotaExceeded(super::QuotaScope::Global))
         );
         assert_eq!(grants.release_renderer(first), 1);
         assert_eq!(grants.active_count(), 1);
         grants
-            .authorize(first_grant, first, origin(77), 7001, 1)
+            .authorize(first_grant, first, snapshot_origin(77), 7001, 1)
             .unwrap_err();
     }
 
@@ -964,11 +974,11 @@ mod tests {
         let mut grants = SnapshotGrantRegistry::new(2, 1).unwrap();
         let owner = renderer(91, 8191);
         assert_eq!(
-            grants.issue(owner, origin(77), 0, 1),
+            grants.issue(owner, snapshot_origin(77), 0, 1),
             Err(SnapshotGrantError::InvalidIdentity)
         );
         assert_eq!(
-            grants.issue(owner, origin(77), 1, 0),
+            grants.issue(owner, snapshot_origin(77), 1, 0),
             Err(SnapshotGrantError::InvalidIdentity)
         );
     }
@@ -977,7 +987,7 @@ mod tests {
     fn snapshot_grant_can_be_revoked_and_renderer_cleanup_releases_remaining_grants() {
         use super::{SnapshotGrantError, SnapshotGrantRegistry};
         let owner = renderer(91, 8191);
-        let origin_id = origin(77);
+        let origin_id = snapshot_origin(77);
         let mut grants = SnapshotGrantRegistry::new(4, 4).unwrap();
         let revoked = grants.issue(owner, origin_id, 7001, 1).unwrap();
         let remaining = grants.issue(owner, origin_id, 7002, 1).unwrap();

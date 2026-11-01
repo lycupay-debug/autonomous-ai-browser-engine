@@ -872,6 +872,41 @@ mod tests {
     }
 
     #[test]
+    fn current_document_snapshot_captures_document_revision_and_registry_scoped_origin() {
+        use super::navigation::{NavigationController, NavigationError};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller
+            .create_root_frame("https://snapshot.example/")
+            .unwrap();
+        assert!(matches!(
+            controller.current_document_snapshot(frame),
+            Err(NavigationError::NoHtmlTree)
+        ));
+        let document = controller.current_document_id(frame).unwrap();
+        controller
+            .parse_document_html(document, b"<!doctype html><p>first</p>")
+            .unwrap();
+        let first = controller.current_document_snapshot(frame).unwrap();
+        assert_eq!(first.document_id(), document.value());
+        assert_eq!(first.revision(), 1);
+        let envelope: serde_json::Value = serde_json::from_slice(first.payload()).unwrap();
+        assert_eq!(envelope["documentId"], document.value().to_string());
+        assert_eq!(envelope["revision"], "1");
+        assert_eq!(
+            first.origin(),
+            controller.document(document).unwrap().origin()
+        );
+
+        controller
+            .parse_document_html(document, b"<!doctype html><p>second</p>")
+            .unwrap();
+        let second = controller.current_document_snapshot(frame).unwrap();
+        assert_eq!(second.document_id(), first.document_id());
+        assert_eq!(second.revision(), 2);
+        assert_ne!(second.payload(), first.payload());
+    }
+
+    #[test]
     fn root_navigation_commit_replaces_document_only_at_commit() {
         use super::navigation::{NavigationController, NavigationMode};
         let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
