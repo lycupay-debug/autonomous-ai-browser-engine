@@ -17,6 +17,23 @@
 
 #define RENDERER_IPC_FD 3
 
+static int limit_standard_descriptors(void)
+{
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_READ);
+    if (cap_rights_limit(STDIN_FILENO, &rights) != 0) {
+        perror("limit renderer stdin rights");
+        return -1;
+    }
+    cap_rights_init(&rights, CAP_WRITE);
+    if (cap_rights_limit(STDOUT_FILENO, &rights) != 0 ||
+        cap_rights_limit(STDERR_FILENO, &rights) != 0) {
+        perror("limit renderer stdout/stderr rights");
+        return -1;
+    }
+    return 0;
+}
+
 static int renderer_process(int inherited_fd)
 {
     if (dup2(inherited_fd, RENDERER_IPC_FD) < 0) {
@@ -27,6 +44,15 @@ static int renderer_process(int inherited_fd)
         (void)close(inherited_fd);
     }
     closefrom(RENDERER_IPC_FD + 1);
+
+    errno = 0;
+    if (fcntl(RENDERER_IPC_FD + 1, F_GETFD) != -1 || errno != EBADF) {
+        (void)fprintf(stderr, "FAIL: unexpected inherited descriptor remains above IPC FD\n");
+        return EXIT_FAILURE;
+    }
+    if (limit_standard_descriptors() != 0) {
+        return EXIT_FAILURE;
+    }
 
     cap_rights_t rights;
     cap_rights_init(&rights, CAP_READ, CAP_WRITE, CAP_FSTAT);

@@ -8,11 +8,11 @@ These tests use temporary processes, socketpairs, directories, and Jail roots. T
 
 ## Broker/Renderer process boundary
 
-`broker-renderer-capsicum-poc.c` forks a renderer over a Unix socketpair. The renderer closes all other inherited descriptors, limits the IPC channel to `CAP_READ | CAP_WRITE | CAP_FSTAT`, enters capability mode, and responds to a broker request. Path-based open is denied. An IPv4 socket can still be created in capability mode, but removing `CAP_CONNECT` from its rights makes outbound `connect()` fail with `ENOTCAPABLE`. Do not claim that `cap_enter()` alone blocks socket creation.
+`broker-renderer-capsicum-poc.c` forks a renderer over a Unix socketpair. The renderer closes all other inherited descriptors, verifies that no descriptor remains above its IPC FD, restricts stdin to `CAP_READ` and stdout/stderr to `CAP_WRITE`, limits the IPC channel to `CAP_READ | CAP_WRITE | CAP_FSTAT`, enters capability mode, and responds to a broker request. Path-based open is denied. An IPv4 socket can still be created in capability mode, but removing `CAP_CONNECT` from its rights makes outbound `connect()` fail with `ENOTCAPABLE`. Do not claim that `cap_enter()` alone blocks socket creation.
 
 ## Per-origin storage descriptor isolation
 
-`origin-storage-capsicum-poc.c` creates two temporary origin storage directories. The broker passes only Origin A's directory FD to the renderer. After descriptor restriction and `cap_enter()`, the renderer can read Origin A, cannot traverse to Origin B, and cannot create a file because write/create rights were not delegated. This tests an OS capability boundary, not the complete web Origin model or cookie/storage semantics.
+`origin-storage-capsicum-poc.c` creates two temporary origin storage directories and a broker/renderer Unix socketpair. The child closes inherited Origin A and Origin B directory FDs before receiving a single Origin A directory FD through `SCM_RIGHTS`; the broker closes its copies after transfer. The renderer restricts stdin/stdout/stderr and IPC rights, applies `CAP_LOOKUP | CAP_READ | CAP_FSTAT` to the delegated storage FD, then enters capability mode. It can read Origin A, cannot traverse to Origin B, and cannot create a file because write/create rights were not delegated. The renderer confirms readiness over IPC and the broker waits for its exit. This tests descriptor delegation and an OS capability boundary, not the complete web Origin model, cookie/storage semantics, or production storage authorization.
 
 ## Renderer crash recovery
 
