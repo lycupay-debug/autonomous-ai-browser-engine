@@ -2,8 +2,9 @@
 //!
 //! `html5ever` supplies HTML tokenization and tree-construction algorithms. This
 //! crate owns the resulting node representation and enforces input, node and
-//! parse-error budgets. It is not yet connected to Navigation, V8 DOM bindings,
-//! CSS, layout, or the browser Network Service.
+//! parse-error budgets. It can export a bounded versioned flat snapshot for a
+//! future process boundary; live DOM bindings, CSS, layout and Network Service
+//! integration remain outside this crate.
 
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell};
@@ -15,6 +16,7 @@ use html5ever::{Attribute, QualName, parse_document};
 pub const MAX_HTML_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_DOM_NODES: usize = 65_536;
 pub const MAX_PARSE_ERRORS: usize = 256;
+pub const MAX_DOM_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 const DOCUMENT_NODE: usize = 0;
 const BUDGET_SENTINEL_NODE: usize = 1;
 
@@ -114,6 +116,28 @@ impl std::fmt::Display for HtmlParseError {
 }
 
 impl std::error::Error for HtmlParseError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HtmlSnapshotError {
+    Serialization(String),
+    TooLarge { actual: usize, limit: usize },
+}
+
+impl std::fmt::Display for HtmlSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialization(message) => {
+                write!(formatter, "DOM snapshot serialization failed: {message}")
+            }
+            Self::TooLarge { actual, limit } => write!(
+                formatter,
+                "DOM snapshot is {actual} bytes; limit is {limit}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HtmlSnapshotError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HtmlDocument {
@@ -246,6 +270,102 @@ impl HtmlDocument {
             }
         }
         Some(output)
+    }
+
+    /// Exports an immutable, versioned, flat DOM snapshot for process boundaries.
+    /// Node IDs are stable only within this parsed Document generation; callers
+    /// must pair them with a Document ID/revision and must not treat this as live DOM.
+    pub fn to_snapshot_json(&self) -> Result<Vec<u8>, HtmlSnapshotError> {
+        use serde_json::{Value, json};
+
+        let mut nodes = Vec::with_capacity(self.nodes.len().saturating_sub(1));
+        for (index, node) in self.nodes.iter().enumerate() {
+            if matches!(&node.data, HtmlNodeData::BudgetSentinel { .. }) {
+                continue;
+            }
+            let id = index;
+            let parent = node.parent.map(|value| value.0);
+            let children: Vec<usize> = node.children.iter().map(|value| value.0).collect();
+            let mut entry = json!({
+                "id": id,
+                "parent": parent,
+                "children": children,
+            });
+            let data =
+                match &node.data {
+                    HtmlNodeData::Document => json!({"type": "document", "nodeType": 9}),
+                    HtmlNodeData::DocumentFragment => {
+                        json!({"type": "document-fragment", "nodeType": 11})
+                    }
+                    HtmlNodeData::Doctype {
+                        name,
+                        public_id,
+                        system_id,
+                    } => json!({
+                        "type": "doctype", "nodeType": 10, "name": name,
+                        "publicId": public_id, "systemId": system_id
+                    }),
+                    HtmlNodeData::Element {
+                        name,
+                        attributes,
+                        template_contents,
+                        ..
+                    } => {
+                        let attrs: Vec<Value> = attributes.iter().map(|attribute| json!({
+                        "namespace": attribute.name.ns.to_string(),
+                        "prefix": attribute.name.prefix.as_ref().map(ToString::to_string),
+                        "name": attribute.name.local.to_string(),
+                        "value": attribute.value.as_ref(),
+                    })).collect();
+                        json!({
+                            "type": "element", "nodeType": 1,
+                            "namespace": name.ns.to_string(),
+                            "prefix": name.prefix.as_ref().map(ToString::to_string),
+                            "name": name.local.to_string(),
+                            "attributes": attrs,
+                            "templateContents": template_contents.map(|value| value.0),
+                        })
+                    }
+                    HtmlNodeData::Text(value) => {
+                        json!({"type": "text", "nodeType": 3, "value": value})
+                    }
+                    HtmlNodeData::Comment(value) => {
+                        json!({"type": "comment", "nodeType": 8, "value": value})
+                    }
+                    HtmlNodeData::ProcessingInstruction { target, contents } => json!({
+                        "type": "processing-instruction", "nodeType": 7,
+                        "target": target, "value": contents
+                    }),
+                    HtmlNodeData::BudgetSentinel { .. } => continue,
+                };
+            entry
+                .as_object_mut()
+                .expect("snapshot node is an object")
+                .extend(
+                    data.as_object()
+                        .expect("snapshot data is an object")
+                        .clone(),
+                );
+            nodes.push(entry);
+        }
+        let snapshot = json!({
+            "schemaVersion": 1,
+            "root": DOCUMENT_NODE,
+            "nodeCount": self.node_count(),
+            "quirksMode": format!("{:?}", self.quirks_mode),
+            "parseErrors": &self.parse_errors,
+            "suppressedParseErrors": self.suppressed_parse_errors,
+            "nodes": nodes,
+        });
+        let encoded = serde_json::to_vec(&snapshot)
+            .map_err(|error| HtmlSnapshotError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_DOM_SNAPSHOT_BYTES {
+            return Err(HtmlSnapshotError::TooLarge {
+                actual: encoded.len(),
+                limit: MAX_DOM_SNAPSHOT_BYTES,
+            });
+        }
+        Ok(encoded)
     }
 
     pub fn serialize_debug_tree(&self) -> String {
@@ -700,6 +820,44 @@ mod tests {
         HtmlNodeData, HtmlParseError, HtmlParseLimits, MAX_DOM_NODES, MAX_HTML_INPUT_BYTES,
         parse_html, parse_html_with_limits,
     };
+
+    #[test]
+    fn exports_versioned_flat_snapshot_with_stable_document_local_ids() {
+        let document = parse_html(
+            "<!doctype html><p id='greeting' title='A &amp; B'>Hello 世界</p><svg><circle/></svg>"
+                .as_bytes(),
+        )
+        .unwrap();
+        let encoded = document.to_snapshot_json().unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(snapshot["schemaVersion"], 1);
+        assert_eq!(snapshot["root"], 0);
+        assert_eq!(
+            snapshot["nodeCount"].as_u64().unwrap() as usize,
+            document.node_count()
+        );
+        let nodes = snapshot["nodes"].as_array().unwrap();
+        assert_eq!(nodes[0]["type"], "document");
+        let paragraph = nodes
+            .iter()
+            .find(|node| node["type"] == "element" && node["name"] == "p")
+            .unwrap();
+        let paragraph_id = paragraph["id"].as_u64().unwrap();
+        assert!(nodes.iter().any(|node| node["parent"] == paragraph_id
+            && node["type"] == "text"
+            && node["value"] == "Hello 世界"));
+        assert!(
+            paragraph["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attribute| attribute["name"] == "title" && attribute["value"] == "A & B")
+        );
+        let svg = nodes.iter().find(|node| node["name"] == "svg").unwrap();
+        assert_eq!(svg["namespace"], "http://www.w3.org/2000/svg");
+        assert!(nodes.iter().any(|node| node["type"] == "doctype"));
+        assert!(std::str::from_utf8(&encoded).is_ok());
+    }
 
     #[test]
     fn parses_document_structure_text_and_named_character_references() {

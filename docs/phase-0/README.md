@@ -551,3 +551,12 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - No HTML Parser → V8 Node wrapper bridge, stable node IDs, DOM mutation/events, Window/Web IDL, forms, CSS, Layout, Paint, accessibility tree or AI evidence snapshot.
 - No production Network Service/IPC integration, streaming/cancellation, cache/cookies/compression, HTTP/2/3 or non-UTF-8 encoding support.
 - `html5ever` provides parser algorithms, but project compatibility still requires pinned html5lib/WPT tests, fuzzing, hostile-input testing and resource profiling.
+
+## 2026-11-01 DOM snapshot export feasibility
+
+- Added `HtmlDocument::to_snapshot_json()` in the HTML Parser crate. It emits a flat `schemaVersion: 1` representation with Document-local node IDs, parent/child edges, node type, namespace-aware element names, attributes, template-content references, quirks mode and parse diagnostics.
+- The encoded payload is capped at 8 MiB. Flat node records avoid recursive serialization of deeply nested untrusted input. The source HTML remains capped at 1 MiB and the parser node budget remains 65,536.
+- Node IDs are only stable within one parsed Document generation and must be paired with a host Document ID/revision. They are not authorization tokens and must be invalidated when the Document tree is replaced.
+- FreeBSD parser tests: 10/10 passed, including UTF-8 CJK text, HTML entity decoding, attribute escaping, SVG namespace and doctype snapshot checks. Parser Clippy with `-D warnings` passed.
+- Full FreeBSD workspace: 154/154 tests passed; workspace Rustfmt and Clippy with `-D warnings` passed. `scripts/run-security-pocs.sh` passed Capsicum FD rights, Broker/Renderer IPC, UDS peer identity, per-Origin storage grant, malformed multi-FD cleanup, renderer crash recovery and Jail IPv4 isolation.
+- This is immutable snapshot serialization only. It does not provide live DOM mutation, V8 wrapper identity, Web IDL, CSS/layout, a production IPC channel, or browser-agent authorization. No production service or persistent host configuration was changed.
