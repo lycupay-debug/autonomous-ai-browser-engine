@@ -5,8 +5,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
-#include <map>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -74,6 +74,25 @@ struct AibeNodeWrapper {
     AibeNodeWrapper* pending_next = nullptr;
 };
 
+struct AibeNodeWrapperKey {
+    AibeNativeNode* node;
+    uint64_t realm_id;
+
+    bool operator==(const AibeNodeWrapperKey& other) const noexcept
+    {
+        return node == other.node && realm_id == other.realm_id;
+    }
+};
+
+struct AibeNodeWrapperKeyHash {
+    size_t operator()(const AibeNodeWrapperKey& key) const noexcept
+    {
+        const auto node_hash = std::hash<AibeNativeNode*>{}(key.node);
+        const auto realm_hash = std::hash<uint64_t>{}(key.realm_id);
+        return node_hash ^ (realm_hash + 0x9e3779b9U + (node_hash << 6U) + (node_hash >> 2U));
+    }
+};
+
 struct AibeV8Runtime {
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
     v8::Isolate* isolate = nullptr;
@@ -86,7 +105,7 @@ struct AibeV8Runtime {
     // Weak per-runtime, per-Realm identity cache; it never roots JS wrappers.
     // Native identity is scoped by Realm: the same host node may have one
     // wrapper per Realm, but wrappers are never silently reused across Worlds.
-    std::map<std::pair<AibeNativeNode*, uint64_t>, AibeNodeWrapper*> node_wrappers;
+    std::unordered_map<AibeNodeWrapperKey, AibeNodeWrapper*, AibeNodeWrapperKeyHash> node_wrappers;
     // Weak callbacks only enqueue wrappers; native/V8 handle destruction is
     // deferred until the isolate has left the GC callback phase.
     AibeNodeWrapper* pending_node_releases = nullptr;
@@ -154,7 +173,7 @@ void node_wrapper_weak_callback(const v8::WeakCallbackInfo<AibeNodeWrapper>& inf
     auto* wrapper = info.GetParameter();
     wrapper->object.Reset();
     auto* owner = wrapper->owner;
-    owner->node_wrappers.erase(std::make_pair(wrapper->node.get(), wrapper->realm_id));
+    owner->node_wrappers.erase(AibeNodeWrapperKey{wrapper->node.get(), wrapper->realm_id});
     wrapper->pending_next = owner->pending_node_releases;
     owner->pending_node_releases = wrapper;
     g_finalized_dom_wrappers.fetch_add(1, std::memory_order_relaxed);
@@ -174,7 +193,7 @@ AibeNodeWrapper* attach_node_wrapper(
         0, v8::External::New(isolate, wrapper, v8::kExternalPointerTypeTagDefault));
     wrapper->object.Reset(isolate, object);
     wrapper->object.SetWeak(wrapper, node_wrapper_weak_callback, v8::WeakCallbackType::kParameter);
-    runtime->node_wrappers.emplace(std::make_pair(wrapper->node.get(), realm_id), wrapper);
+    runtime->node_wrappers.emplace(AibeNodeWrapperKey{wrapper->node.get(), realm_id}, wrapper);
     return wrapper;
 }
 
@@ -189,7 +208,7 @@ v8::MaybeLocal<v8::Object> wrap_node(
     if (current_realm_id(isolate) != realm_id) {
         return {};
     }
-    const auto key = std::make_pair(node.get(), realm_id);
+    const AibeNodeWrapperKey key{node.get(), realm_id};
     auto found = runtime->node_wrappers.find(key);
     if (found != runtime->node_wrappers.end()) {
         auto object = found->second->object.Get(isolate);
@@ -266,6 +285,35 @@ void node_append_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     }
     child->node->parent = parent->node;
     parent->node->children.push_back(child->node);
+    info.GetReturnValue().Set(info[0]);
+}
+
+void node_remove_child(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* parent = node_wrapper_from(isolate, info.This());
+    if (parent == nullptr || info.Length() < 1 || !info[0]->IsObject()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "removeChild requires a Node")));
+        return;
+    }
+    auto* child = node_wrapper_from(isolate, info[0].As<v8::Object>());
+    if (child == nullptr || child->owner != parent->owner
+        || child->realm_id != parent->realm_id) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "removeChild received an invalid Node")));
+        return;
+    }
+
+    auto& children = parent->node->children;
+    auto found = std::find(children.begin(), children.end(), child->node);
+    if (found == children.end()) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "NotFoundError")));
+        return;
+    }
+    child->node->parent.reset();
+    children.erase(found);
     info.GetReturnValue().Set(info[0]);
 }
 
@@ -447,6 +495,10 @@ bool initialize_node_template(AibeV8Runtime* runtime)
         isolate,
         "appendChild",
         v8::FunctionTemplate::New(isolate, node_append_child));
+    node_template->PrototypeTemplate()->Set(
+        isolate,
+        "removeChild",
+        v8::FunctionTemplate::New(isolate, node_remove_child));
     node_template->PrototypeTemplate()->Set(
         isolate,
         "childCount",
@@ -1000,6 +1052,61 @@ extern "C" int aibe_v8_destroy_realm(void* opaque, uint64_t realm_id)
     }
     found->second.Reset();
     runtime->realms.erase(found);
+    return 0;
+}
+
+// Test-only probe: one native Node identity must map to distinct wrappers
+// in distinct Realms, while repeated wrapping in one Realm preserves identity.
+extern "C" int aibe_v8_realm_wrapper_cache_probe(
+    void* opaque, uint64_t first_realm_id, uint64_t second_realm_id)
+{
+    if (opaque == nullptr || first_realm_id == 0 || second_realm_id == 0
+        || first_realm_id == second_realm_id) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    auto first = runtime->realms.find(first_realm_id);
+    auto second = runtime->realms.find(second_realm_id);
+    if (first == runtime->realms.end() || second == runtime->realms.end()) {
+        return -9;
+    }
+
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+    auto native_node = std::make_shared<AibeNativeNode>();
+    v8::Local<v8::Object> first_wrapper;
+    v8::Local<v8::Object> first_wrapper_again;
+    v8::Local<v8::Object> second_wrapper;
+    {
+        auto context = first->second.Get(runtime->isolate);
+        v8::Context::Scope context_scope(context);
+        if (!wrap_node(runtime, native_node, first_realm_id).ToLocal(&first_wrapper)
+            || !wrap_node(runtime, native_node, first_realm_id).ToLocal(&first_wrapper_again)) {
+            return -8;
+        }
+        if (!first_wrapper->StrictEquals(first_wrapper_again)) {
+            return -10;
+        }
+    }
+    {
+        auto context = second->second.Get(runtime->isolate);
+        v8::Context::Scope context_scope(context);
+        if (!wrap_node(runtime, native_node, second_realm_id).ToLocal(&second_wrapper)) {
+            return -11;
+        }
+        if (first_wrapper->StrictEquals(second_wrapper)) {
+            return -12;
+        }
+        if (node_wrapper_from(runtime->isolate, first_wrapper) != nullptr) {
+            return -13;
+        }
+        if (node_wrapper_from(runtime->isolate, second_wrapper) == nullptr) {
+            return -14;
+        }
+    }
     return 0;
 }
 

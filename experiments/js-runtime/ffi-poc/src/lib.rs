@@ -148,6 +148,12 @@ mod native {
         fn aibe_v8_finalized_dom_wrapper_count() -> usize;
         #[cfg(test)]
         pub(super) fn aibe_v8_cppgc_cycle_probe() -> c_int;
+        #[cfg(test)]
+        pub(super) fn aibe_v8_realm_wrapper_cache_probe(
+            handle: *mut c_void,
+            first_realm_id: u64,
+            second_realm_id: u64,
+        ) -> c_int;
         fn aibe_v8_destroy(handle: *mut c_void) -> c_int;
         fn aibe_spidermonkey_create() -> *mut c_void;
         fn aibe_spidermonkey_eval(
@@ -377,6 +383,24 @@ mod native {
         pub fn finalized_dom_wrapper_count() -> usize {
             unsafe { aibe_v8_finalized_dom_wrapper_count() }
         }
+
+        #[cfg(test)]
+        pub fn realm_wrapper_cache_probe(
+            &mut self,
+            first: super::JsRealmId,
+            second: super::JsRealmId,
+        ) -> i32 {
+            if first.runtime_id != self.runtime_id || second.runtime_id != self.runtime_id {
+                return -14;
+            }
+            unsafe {
+                aibe_v8_realm_wrapper_cache_probe(
+                    self.handle.as_ptr(),
+                    first.realm_id,
+                    second.realm_id,
+                )
+            }
+        }
     }
 
     impl Drop for V8Runtime {
@@ -584,6 +608,11 @@ mod tests {
         let first = runtime.create_realm().expect("first realm is created");
         let second = runtime.create_realm().expect("second realm is created");
         assert_ne!(first, second);
+        assert_eq!(
+            runtime.realm_wrapper_cache_probe(first, second),
+            0,
+            "the same native Node has stable per-Realm wrappers and cannot be used from another Realm"
+        );
 
         // Every Context receives its own Node host binding. Wrapper identity is
         // stable within that Realm and does not depend on the default Context.
@@ -742,6 +771,18 @@ mod tests {
         );
         assert_eq!(
             runtime
+                .eval("(() => { const parent = new Node(); const child = new Node(); parent.appendChild(child); const removed = parent.removeChild(child); return (removed === child) + ':' + parent.childCount(); })()")
+                .expect("removeChild detaches and returns the child"),
+            "true:0"
+        );
+        assert_eq!(
+            runtime
+                .eval("(() => { const parent = new Node(); const child = new Node(); try { parent.removeChild(child); return 'missing-allowed'; } catch (error) { return error.message; } })()")
+                .expect("removeChild rejects a non-child"),
+            "NotFoundError"
+        );
+        assert_eq!(
+            runtime
                 .eval("(() => { const parent = new Node(); const child = new Node(); parent.appendChild(child); try { child.appendChild(parent); return 'cycle-allowed'; } catch (error) { return error.message; } })()")
                 .expect("ancestor cycle is rejected"),
             "HierarchyRequestError"
@@ -787,6 +828,25 @@ mod tests {
                 .eval("rootNode.firstChild().childCount()")
                 .expect("recreated wrapper references the same native node"),
             "0"
+        );
+    }
+
+    #[test]
+    fn v8_dom_detached_child_wrapper_is_released_after_gc() {
+        let before = V8Runtime::finalized_dom_wrapper_count();
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        assert_eq!(
+            runtime
+                .eval("globalThis.detachParent = new Node(); (() => { const detached = new Node(); detachParent.appendChild(detached); detachParent.removeChild(detached); })(); detachParent.childCount()")
+                .expect("detached child is no longer retained by its former parent"),
+            "0"
+        );
+        runtime
+            .collect_garbage()
+            .expect("detached child wrapper becomes collectible");
+        assert!(
+            V8Runtime::finalized_dom_wrapper_count() > before,
+            "detached child wrapper should be finalized after its final native owner is released"
         );
     }
 
