@@ -1,0 +1,9 @@
+[package]
+name = "aibe-browser-runtime-origin-poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+aibe-js-runtime-ffi-poc = { path = "../js-runtime/ffi-poc" }
+aibe-origin-policy-poc = { path = "../origin-policy" }

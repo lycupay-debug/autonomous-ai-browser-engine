@@ -17,6 +17,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aibe-browser-runtime-origin-poc"
+version = "0.1.0"
+dependencies = [
+ "aibe-js-runtime-ffi-poc",
+ "aibe-origin-policy-poc",
+]
+
+[[package]]
 name = "aibe-control-protocol-uds-poc"
 version = "0.1.0"
 dependencies = [

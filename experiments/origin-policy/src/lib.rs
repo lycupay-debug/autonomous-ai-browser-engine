@@ -5,7 +5,7 @@
 //! registry-scoped and is intended to be mapped to a runtime's opaque origin
 //! handle by the Browser Runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use url::{Origin as UrlOrigin, Url};
@@ -26,6 +26,7 @@ pub enum OriginPolicyError {
     InvalidUrl(url::ParseError),
     ForeignRegistry,
     IdentifierSpaceExhausted,
+    UnknownOriginGroup,
 }
 
 impl fmt::Display for OriginPolicyError {
@@ -38,6 +39,7 @@ impl fmt::Display for OriginPolicyError {
             Self::IdentifierSpaceExhausted => {
                 formatter.write_str("origin identifier space exhausted")
             }
+            Self::UnknownOriginGroup => formatter.write_str("origin group is no longer active"),
         }
     }
 }
@@ -53,6 +55,8 @@ pub struct OriginRegistry {
     registry_id: u64,
     next_group_id: u64,
     groups: HashMap<UrlOrigin, u64>,
+    tuple_origins: HashMap<u64, UrlOrigin>,
+    issued_groups: HashSet<u64>,
 }
 
 impl OriginRegistry {
@@ -66,6 +70,8 @@ impl OriginRegistry {
             registry_id,
             next_group_id: 1,
             groups: HashMap::new(),
+            tuple_origins: HashMap::new(),
+            issued_groups: HashSet::new(),
         })
     }
 
@@ -91,17 +97,31 @@ impl OriginRegistry {
 
     /// Checks whether a handle was issued by this registry and remains valid.
     pub fn validate(&self, origin: OriginGroupId) -> Result<(), OriginPolicyError> {
-        if origin.registry_id != self.registry_id
-            || origin.group_id == 0
-            || origin.group_id >= self.next_group_id
-        {
+        if origin.registry_id != self.registry_id {
             return Err(OriginPolicyError::ForeignRegistry);
+        }
+        if !self.issued_groups.contains(&origin.group_id) {
+            return Err(OriginPolicyError::UnknownOriginGroup);
+        }
+        Ok(())
+    }
+
+    /// Releases a group after its final active Realm has been destroyed.
+    /// Tuple-origin interning and opaque-origin handles are both removed so a
+    /// long-running browser does not retain every origin it has ever visited.
+    pub fn release(&mut self, origin: OriginGroupId) -> Result<(), OriginPolicyError> {
+        self.validate(origin)?;
+        self.issued_groups.remove(&origin.group_id);
+        if let Some(tuple_origin) = self.tuple_origins.remove(&origin.group_id) {
+            self.groups.remove(&tuple_origin);
         }
         Ok(())
     }
 
     fn intern_origin(&mut self, origin: UrlOrigin) -> Result<OriginGroupId, OriginPolicyError> {
-        if let Some(group_id) = self.groups.get(&origin).copied() {
+        if let UrlOrigin::Tuple(..) = &origin
+            && let Some(group_id) = self.groups.get(&origin).copied()
+        {
             return Ok(OriginGroupId {
                 registry_id: self.registry_id,
                 group_id,
@@ -112,7 +132,11 @@ impl OriginRegistry {
         }
         let group_id = self.next_group_id;
         self.next_group_id += 1;
-        self.groups.insert(origin, group_id);
+        self.issued_groups.insert(group_id);
+        if matches!(origin, UrlOrigin::Tuple(..)) {
+            self.groups.insert(origin.clone(), group_id);
+            self.tuple_origins.insert(group_id, origin);
+        }
         Ok(OriginGroupId {
             registry_id: self.registry_id,
             group_id,
@@ -252,6 +276,32 @@ mod tests {
             Err(OriginPolicyError::ForeignRegistry)
         ));
         assert!(first.validate(origin).is_ok());
+    }
+
+    #[test]
+    fn releasing_a_tuple_origin_invalidates_the_handle_and_allows_reinterning() {
+        let mut registry = OriginRegistry::new().unwrap();
+        let first = registry.resolve_url("https://example.com/").unwrap();
+        assert!(registry.validate(first).is_ok());
+        registry.release(first).unwrap();
+        assert!(matches!(
+            registry.validate(first),
+            Err(OriginPolicyError::UnknownOriginGroup)
+        ));
+        let second = registry.resolve_url("https://example.com/next").unwrap();
+        assert_ne!(first, second);
+        assert!(registry.validate(second).is_ok());
+    }
+
+    #[test]
+    fn opaque_origin_release_invalidates_its_handle() {
+        let mut registry = OriginRegistry::new().unwrap();
+        let opaque = registry.create_opaque_origin().unwrap();
+        registry.release(opaque).unwrap();
+        assert!(matches!(
+            registry.validate(opaque),
+            Err(OriginPolicyError::UnknownOriginGroup)
+        ));
     }
 
     #[test]

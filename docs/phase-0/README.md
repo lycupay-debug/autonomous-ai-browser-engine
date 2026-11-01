@@ -121,6 +121,7 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 
 - FreeBSD `cargo test --workspace --locked -- --test-threads=1`: 45 passed, 0 failed (Boa 7, UDS 9, Headless 3, V8 FFI 9, Network 17).
 - `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed.
 - Native V8 and SpiderMonkey embed builds: both executed `1 + 2` and returned `3`.
 - Test262 fixed subset: V8 284 passed / 0 failed / 10 skipped; SpiderMonkey 284 passed / 0 failed / 10 skipped; Boa uses the same pinned project harness subset as recorded above. These remain limited harness results.
@@ -279,12 +280,43 @@ Added an independent Rust experiment under `experiments/origin-policy/`. URL par
 
 ### Verification
 
-- Origin policy unit tests: 13/13 passed on FreeBSD 15.1-RELEASE-p6.
+- Origin policy unit tests: 15/15 passed on FreeBSD 15.1-RELEASE-p6.
 - Dependency was already present in `Cargo.lock` as `url 2.5.8`; workspace lock metadata updated offline, without fetching or changing the dependency version.
-- This crate has not yet been wired into a Browser/Frame/Navigation runtime. It does not yet handle inherited-origin navigation, sandbox flags, `document.domain`, agent clusters, or process/site isolation.
+- The registry is now connected to the generic Browser Runtime coordinator PoC, but not yet to real Navigation/Document/Frame objects. It does not yet handle inherited-origin navigation, sandbox flags, `document.domain`, agent clusters, or process/site isolation.
 
 ### Security boundary
 
 - The registry handle is an internal host grouping token, not a user-visible serialization and not a cryptographic secret.
 - Never derive an authorization grant from untrusted page content. The trusted navigation/Document lifecycle must decide when a URL's computed origin is inherited, replaced, or forced opaque.
 - This is a Phase 0 origin primitive, not a complete browser Same-Origin Policy implementation.
+
+
+## Browser Runtime Origin-to-Realm coordinator PoC — 2026-11-01
+
+### Objective
+
+Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/Realm API without moving URL parsing into the V8 adapter. The Browser Runtime owns the mapping and the lifecycle reference counts.
+
+### Implementation
+
+- Added `experiments/browser-runtime/` (`aibe-browser-runtime-origin-poc`).
+- Added a small `OriginRealmRuntime` lifecycle contract with a blanket adapter for the project `JsRuntime` trait; tests use a deterministic mock so the orchestration logic can run in hosted CI without V8 binaries.
+- Added `OriginRealmCoordinator`: canonical URL tuple origins map to one JS Runtime origin handle while one or more Realms remain active; every navigation/document receives a distinct Realm/Context.
+- Added explicit inherited-origin creation from a live creator Realm, and fresh opaque-origin creation for sandboxed contexts.
+- Destroying the last Realm releases both the Browser Runtime mapping and tuple-origin interning entry; opaque handles are not retained in the tuple map, preventing unbounded accumulation of visited origins. Failed Realm creation releases its new group; inherited creation from a destroyed creator is rejected.
+- Added a FreeBSD-only V8 integration test for canonical URL → host Origin Group → V8 origin handle → Realm creation/destruction, confirming same-origin Realms still have separate JS global environments.
+- Updated SBOM generation/validation to include seven workspace crates.
+
+### Verification
+
+- Hosted-compatible coordinator unit tests: 6/6 passed using the deterministic mock; FreeBSD-only V8 integration test: 1/1 passed, including stale Realm evaluation rejection.
+- Full FreeBSD workspace: 80/80 tests passed (Boa 7, Browser Runtime 7, UDS 9, Headless 4, V8 FFI 21, Network 17, Origin Policy 15).
+- `cargo fmt --all -- --check`: passed.
+- SBOM generator/validator now expect 7 crate artifacts; shell syntax, Python AST, and 7/7 workspace coverage checks passed. Local cargo-cyclonedx remains unavailable, so CI must verify actual generation and format.
+
+### Limitations
+
+- This is a lifecycle/orchestration PoC, not the production Browser Runtime.
+- It does not yet model Document, Frame, Worker, Agent Cluster, browsing context groups, opener relationships, sandbox flags, process/site isolation, or navigation commit/rollback.
+- Origin mapping is retained only while at least one Realm in the group is active. Persistent storage partitioning and browsing-session lifetime are separate concerns.
+- The V8 integration test proves URL-origin mapping and Context lifecycle; cross-origin native wrapper access is covered by the FFI crate's dedicated probe, not by a general DOM or Same-Origin Policy implementation.
