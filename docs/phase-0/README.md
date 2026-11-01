@@ -560,3 +560,22 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - FreeBSD parser tests: 10/10 passed, including UTF-8 CJK text, HTML entity decoding, attribute escaping, SVG namespace and doctype snapshot checks. Parser Clippy with `-D warnings` passed.
 - Full FreeBSD workspace: 154/154 tests passed; workspace Rustfmt and Clippy with `-D warnings` passed. `scripts/run-security-pocs.sh` passed Capsicum FD rights, Broker/Renderer IPC, UDS peer identity, per-Origin storage grant, malformed multi-FD cleanup, renderer crash recovery and Jail IPv4 isolation.
 - This is immutable snapshot serialization only. It does not provide live DOM mutation, V8 wrapper identity, Web IDL, CSS/layout, a production IPC channel, or browser-agent authorization. No production service or persistent host configuration was changed.
+
+## 2026-11-01 Document-scoped snapshot envelope
+
+- Browser Runtime now exposes `document_snapshot_json(DocumentId)`, wrapping the parser snapshot in `envelopeVersion: 1` with host-issued `documentId` and monotonic `revision`.
+- A Document begins at revision 0 before a parsed tree exists; each successful `parse_document_html()` replacement increments the revision. A navigation commit with parsed HTML creates a new Document ID at revision 1. Failed parsing leaves the current tree and revision unchanged.
+- Parser Node IDs are deterministic local indices and can be reused after a reparse. Consumers must therefore treat `(documentId, revision, nodeId)` as the complete node-handle scope; `nodeId` alone is never stable across tree replacement. A replaced Document is no longer addressable by the controller.
+- Snapshot envelopes are capped at 8 MiB and reject requests for Documents without a parsed HTML tree.
+- Browser Runtime tests: 38/38 passed, including revision increment, same-index reuse across revisions, navigation replacement, and stale Document rejection.
+- Full FreeBSD workspace: 155/155 passed; Rustfmt, Workspace Clippy (`-D warnings`), `git diff --check`, and the full security PoC suite passed. The V8 test binary requires `LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib` with `AIBE_RUNTIME_PREFIX` unset.
+- This is host-side identity/revision binding for immutable snapshots only. It is not an authenticated IPC protocol, renderer-side handle validation, live DOM, or a security grant. The next task is to bind this envelope to the authenticated, bounded UDS channel and test malformed/stale/cross-Document payload rejection.
+
+## 2026-11-01 Document-scoped Node handle validation
+
+- Added host-issued `DocumentNodeHandle` carrying `(DocumentId, revision, NodeId)`; parser-local NodeId is not accepted as a complete external handle.
+- `node_handle()` issues handles only for nodes present in the current parsed tree. `resolve_node_handle(expected_document, handle)` rejects cross-Document use, stale revisions after reparse, unknown Documents, missing trees and unknown Node IDs.
+- Snapshot envelope encodes the u64 Document ID and revision as decimal strings, avoiding precision loss in JSON consumers whose native Number type is only exact through 53 bits. Node IDs remain bounded parser-local indices.
+- Added regression coverage for a valid handle, cross-Document rejection, and stale-handle rejection after a reparse that deliberately reuses the same NodeId index.
+- Browser Runtime: 39/39 passed; full workspace after this addition: 156/156 passed; Rustfmt, Clippy (`-D warnings`), diff check and Security PoC suite passed.
+- This validates host-side handle scoping only. No remote Renderer has yet parsed or enforced the envelope, and no UDS transfer or live V8 DOM wrapper mapping is claimed.

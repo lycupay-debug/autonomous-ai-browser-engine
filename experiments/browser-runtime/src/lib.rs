@@ -699,6 +699,119 @@ mod tests {
     }
 
     #[test]
+    fn document_snapshot_envelope_binds_node_ids_to_document_and_revision() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        assert!(matches!(
+            controller.document_snapshot_json(original),
+            Err(NavigationError::NoHtmlTree)
+        ));
+
+        controller
+            .parse_document_html(original, b"<main><p id='old'>old</p></main>")
+            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&controller.document_snapshot_json(original).unwrap()).unwrap();
+        assert_eq!(first["envelopeVersion"], 1);
+        assert_eq!(first["documentId"], original.value().to_string());
+        assert_eq!(first["revision"], "1");
+        let first_node_id = first["tree"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["type"] == "element" && node["name"] == "p")
+            .unwrap()["id"]
+            .clone();
+
+        controller
+            .parse_document_html(original, b"<main><p id='new'>new</p></main>")
+            .unwrap();
+        let second: serde_json::Value =
+            serde_json::from_slice(&controller.document_snapshot_json(original).unwrap()).unwrap();
+        assert_eq!(second["documentId"], original.value().to_string());
+        assert_eq!(second["revision"], "2");
+        // Parser-local indices may be reused after a reparse; the revision is
+        // therefore part of every externally retained Node handle.
+        assert_eq!(
+            second["tree"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["type"] == "element" && node["name"] == "p")
+                .unwrap()["id"],
+            first_node_id
+        );
+
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let replacement = controller
+            .commit_navigation_with_html(navigation, b"<p>replacement</p>")
+            .unwrap();
+        assert_ne!(replacement, original);
+        assert!(matches!(
+            controller.document_snapshot_json(original),
+            Err(NavigationError::UnknownDocument)
+        ));
+        let replacement_snapshot: serde_json::Value =
+            serde_json::from_slice(&controller.document_snapshot_json(replacement).unwrap())
+                .unwrap();
+        assert_eq!(
+            replacement_snapshot["documentId"],
+            replacement.value().to_string()
+        );
+        assert_eq!(replacement_snapshot["revision"], "1");
+    }
+
+    #[test]
+    fn document_node_handles_reject_stale_and_cross_document_references() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let root_document = controller.current_document_id(root).unwrap();
+        controller
+            .parse_document_html(root_document, b"<p>root</p>")
+            .unwrap();
+        let root_node = controller
+            .document(root_document)
+            .unwrap()
+            .html_document()
+            .unwrap()
+            .find_first_element_by_tag_name("p")
+            .unwrap();
+        let root_handle = controller.node_handle(root_document, root_node).unwrap();
+        assert!(matches!(
+            controller
+                .resolve_node_handle(root_document, root_handle)
+                .unwrap()
+                .data(),
+            aibe_html_parser_poc::HtmlNodeData::Element { .. }
+        ));
+
+        let child = controller
+            .create_child_frame(root, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let child_document = controller.current_document_id(child).unwrap();
+        controller
+            .parse_document_html(child_document, b"<p>child</p>")
+            .unwrap();
+        assert!(matches!(
+            controller.resolve_node_handle(child_document, root_handle),
+            Err(NavigationError::CrossDocumentNodeHandle)
+        ));
+
+        controller
+            .parse_document_html(root_document, b"<p>new root</p>")
+            .unwrap();
+        assert!(matches!(
+            controller.resolve_node_handle(root_document, root_handle),
+            Err(NavigationError::StaleNodeHandle)
+        ));
+    }
+
+    #[test]
     fn failed_html_parse_preserves_the_current_document_tree() {
         use super::navigation::{NavigationController, NavigationError};
         use aibe_html_parser_poc::{HtmlParseError, MAX_HTML_INPUT_BYTES};

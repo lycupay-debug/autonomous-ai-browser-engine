@@ -8,3 +8,4 @@ publish = false
 aibe-js-runtime-ffi-poc = { path = "../js-runtime/ffi-poc" }
 aibe-origin-policy-poc = { path = "../origin-policy" }
 aibe-html-parser-poc = { path = "../html-parser" }
+serde_json = "=1.0.154"
