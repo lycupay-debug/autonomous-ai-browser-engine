@@ -193,6 +193,31 @@ impl DocumentNodeHandle {
     }
 }
 
+/// Immutable snapshot and its host-owned authority metadata, captured from one
+/// current committed Document. The payload itself is not an authorization token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentSnapshot {
+    document_id: u64,
+    revision: u64,
+    origin: OriginGroupId,
+    payload: Vec<u8>,
+}
+
+impl DocumentSnapshot {
+    pub const fn document_id(&self) -> u64 {
+        self.document_id
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub const fn origin(&self) -> OriginGroupId {
+        self.origin
+    }
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
 pub struct Document<R: OriginRealmRuntime> {
     id: DocumentId,
     frame: FrameId,
@@ -962,6 +987,33 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         self.frames
             .get(&frame)
             .and_then(|entry| entry.current_document)
+    }
+
+    /// Captures the currently committed Document's immutable HTML Snapshot and
+    /// host Origin identity together. The immutable borrow prevents same-thread
+    /// navigation or reparse from changing ownership during capture.
+    pub fn current_document_snapshot(
+        &self,
+        frame: FrameId,
+    ) -> Result<DocumentSnapshot, NavigationError<R::Error>> {
+        let document_id = self
+            .current_document_id(frame)
+            .ok_or(NavigationError::NoCurrentDocument)?;
+        let document = self
+            .documents
+            .get(&document_id)
+            .ok_or(NavigationError::UnknownDocument)?;
+        if document.html_document.is_none() {
+            return Err(NavigationError::NoHtmlTree);
+        }
+        let origin = document.origin;
+        let payload = self.document_snapshot_json(document_id)?;
+        Ok(DocumentSnapshot {
+            document_id: document_id.value(),
+            revision: document.html_revision,
+            origin,
+            payload,
+        })
     }
 
     pub fn document(&self, document: DocumentId) -> Option<&Document<R>> {

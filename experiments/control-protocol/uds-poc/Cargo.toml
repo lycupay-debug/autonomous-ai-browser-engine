@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 serde_json = "=1.0.154"
 aibe-broker-policy-poc = { path = "../../broker-policy" }
+aibe-origin-policy-poc = { path = "../../origin-policy" }

@@ -1,0 +1,13 @@
+[package]
+name = "aibe-snapshot-bridge-poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+aibe-browser-runtime-origin-poc = { path = "../browser-runtime" }
+aibe-broker-policy-poc = { path = "../broker-policy" }
+aibe-control-protocol-uds-poc = { path = "../control-protocol/uds-poc" }
+
+serde_json = "=1.0.154"
+aibe-origin-policy-poc = { path = "../origin-policy" }

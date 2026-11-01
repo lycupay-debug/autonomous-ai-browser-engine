@@ -20,6 +20,14 @@ pub struct OriginGroupId {
     group_id: u64,
 }
 
+impl OriginGroupId {
+    /// Returns the host registry namespace and group sequence for trusted
+    /// in-process Broker mapping. These values are identifiers, not secrets.
+    pub const fn identity_parts(self) -> (u64, u64) {
+        (self.registry_id, self.group_id)
+    }
+}
+
 /// Errors produced while parsing URLs or validating origin-group handles.
 #[derive(Debug)]
 pub enum OriginPolicyError {
@@ -310,6 +318,16 @@ mod tests {
         let opaque_b = registry.create_opaque_origin().unwrap();
         assert_ne!(tuple, opaque_a);
         assert_ne!(opaque_a, opaque_b);
+    }
+
+    #[test]
+    fn identity_parts_distinguish_same_group_sequence_from_different_registries() {
+        let mut first_registry = OriginRegistry::new().unwrap();
+        let mut second_registry = OriginRegistry::new().unwrap();
+        let first = first_registry.resolve_url("https://example.com/").unwrap();
+        let second = second_registry.resolve_url("https://example.com/").unwrap();
+        assert_ne!(first.identity_parts(), second.identity_parts());
+        assert_eq!(first.identity_parts().1, second.identity_parts().1);
     }
 
     #[test]

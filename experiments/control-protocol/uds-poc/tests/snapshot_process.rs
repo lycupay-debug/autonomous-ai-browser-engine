@@ -7,10 +7,11 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aibe_broker_policy_poc::{OriginGroupId, RendererId, RendererPrincipal, SnapshotGrantRegistry};
+use aibe_broker_policy_poc::{RendererId, RendererPrincipal, SnapshotGrantRegistry};
 use aibe_control_protocol_uds_poc::bind_private_socket;
 use aibe_control_protocol_uds_poc::snapshot_endpoint::send_authorized_snapshot;
 use aibe_control_protocol_uds_poc::snapshot_frame::DomSnapshotFrame;
+use aibe_origin_policy_poc::OriginRegistry;
 use serde_json::json;
 
 unsafe extern "C" {
@@ -59,6 +60,13 @@ fn spawn_renderer(path: &PathBuf) -> Child {
         .arg("receive")
         .arg(path)
         .spawn()
+        .unwrap()
+}
+
+fn origin(id: u64) -> aibe_origin_policy_poc::OriginGroupId {
+    let mut registry = OriginRegistry::new().unwrap();
+    registry
+        .resolve_url(&format!("https://snapshot-{id}.example/"))
         .unwrap()
 }
 
@@ -130,7 +138,7 @@ fn cleanup(mut connection: TestConnection) {
 #[test]
 fn broker_authenticates_renderer_and_sends_granted_snapshot_across_processes() {
     let mut connection = test_connection();
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(16, 4).unwrap();
     let grant = grants.issue(connection.renderer, origin, 7, 3).unwrap();
     let receipt = send_authorized_snapshot(
@@ -157,7 +165,7 @@ fn broker_authenticates_renderer_and_sends_granted_snapshot_across_processes() {
 fn broker_endpoint_rejects_wrong_kernel_peer_pid_before_sending() {
     let mut connection = test_connection();
     let wrong_renderer = make_renderer(connection.child.id().saturating_add(1), 0xA1B2_C3D4);
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants.issue(wrong_renderer, origin, 7, 3).unwrap();
     let result = send_authorized_snapshot(
@@ -178,7 +186,7 @@ fn broker_endpoint_rejects_wrong_renderer_instance_after_peer_authentication() {
     let mut connection = test_connection();
     let grant_owner = connection.renderer;
     let replacement = make_renderer(connection.child.id(), 0xA1B2_C3D5);
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants.issue(grant_owner, origin, 7, 3).unwrap();
     let result = send_authorized_snapshot(
@@ -201,8 +209,8 @@ fn broker_endpoint_rejects_wrong_renderer_instance_after_peer_authentication() {
 #[test]
 fn broker_endpoint_rejects_wrong_origin_and_preserves_grant() {
     let mut connection = test_connection();
-    let grant_origin = OriginGroupId::new(0x7711).unwrap();
-    let wrong_origin = OriginGroupId::new(0x7712).unwrap();
+    let grant_origin = origin(0x7711);
+    let wrong_origin = origin(0x7712);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants
         .issue(connection.renderer, grant_origin, 7, 3)
@@ -227,7 +235,7 @@ fn broker_endpoint_rejects_wrong_origin_and_preserves_grant() {
 #[test]
 fn broker_endpoint_rejects_stale_document_revision() {
     let mut connection = test_connection();
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants.issue(connection.renderer, origin, 7, 2).unwrap();
     let result = send_authorized_snapshot(
@@ -250,7 +258,7 @@ fn broker_endpoint_rejects_stale_document_revision() {
 #[test]
 fn broker_endpoint_rejects_wrong_document_grant_binding() {
     let mut connection = test_connection();
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants.issue(connection.renderer, origin, 7001, 3).unwrap();
     let result = send_authorized_snapshot(
@@ -273,7 +281,7 @@ fn broker_endpoint_rejects_wrong_document_grant_binding() {
 #[test]
 fn broker_endpoint_rejects_mismatch_between_frame_and_embedded_envelope() {
     let mut connection = test_connection();
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants.issue(connection.renderer, origin, 7, 3).unwrap();
     let mut frame = test_frame();
@@ -298,7 +306,7 @@ fn broker_endpoint_rejects_mismatch_between_frame_and_embedded_envelope() {
 #[test]
 fn broker_endpoint_rejects_zero_request_id_without_consuming_grant() {
     let mut connection = test_connection();
-    let origin = OriginGroupId::new(0x7711).unwrap();
+    let origin = origin(0x7711);
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
     let grant = grants.issue(connection.renderer, origin, 7, 3).unwrap();
     let mut frame = test_frame();

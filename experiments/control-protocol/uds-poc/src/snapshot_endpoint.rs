@@ -9,8 +9,10 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+use aibe_origin_policy_poc::OriginGroupId as HostOriginGroupId;
+
 use aibe_broker_policy_poc::{
-    OriginGroupId, RendererPrincipal, SnapshotGrantError, SnapshotGrantId, SnapshotGrantRegistry,
+    RendererPrincipal, SnapshotGrantError, SnapshotGrantId, SnapshotGrantRegistry,
 };
 
 use crate::peer_process_credentials;
@@ -26,7 +28,7 @@ pub struct AuthorizedRenderer {
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
-    pub origin: OriginGroupId,
+    pub origin: HostOriginGroupId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +50,7 @@ fn deny(message: &'static str) -> io::Error {
 pub fn send_authorized_snapshot(
     stream: &mut UnixStream,
     registered_renderer: RendererPrincipal,
-    registered_origin: OriginGroupId,
+    registered_origin: HostOriginGroupId,
     grant: SnapshotGrantId,
     grants: &mut SnapshotGrantRegistry,
     frame: &DomSnapshotFrame,
