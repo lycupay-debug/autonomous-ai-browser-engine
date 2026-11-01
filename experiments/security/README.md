@@ -39,3 +39,7 @@ The host currently reports `kern.racct.enable=0`. Consequently, rctl enforcement
 ```
 
 These experiments do not establish a complete browser Renderer Sandbox. Cross-Origin process policy, actual page-origin assignment, network broker enforcement, `rctl`, hostile IPC payload handling under load, privilege transitions, and production crash recovery remain separate gates.
+
+## Broker grant lifecycle and quota policy model
+
+`experiments/broker-policy/` is a dependency-free Rust policy prototype. It binds one-shot read-only storage grants to a Broker-issued Renderer instance ID, PID/UID/GID tuple, and host-issued Origin Group; rejects grant replay, cross-renderer/PID-reuse attempts, cross-Origin requests, and rights escalation; and enforces global and per-renderer active-grant quotas. Grant IDs are scoped to one in-memory registry. A delegated-grant revocation enters `RevocationPending`, blocks further transfers, and requires the caller to terminate the Renderer; quota and grant records are released only after the supervisor confirms process exit. This model does not authenticate kernel peer credentials, pass file descriptors, terminate processes, persist audit state, or constitute a production Broker.

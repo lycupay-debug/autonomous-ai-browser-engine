@@ -400,3 +400,25 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Updated the build-script fallback to the documented isolated prefix. No packages were installed and no host include/library paths were modified.
 - Verified the full workspace with `AIBE_RUNTIME_PREFIX` explicitly unset and `LD_LIBRARY_PATH` pointing at the extracted SDK: 88/88 tests passed. Formatting and Clippy with `-D warnings` passed.
 - This fixes the default build path for the existing Phase 0 extracted SDK layout; it does not make the external V8/SpiderMonkey SDK part of the repository or remove the documented runtime-library environment requirement.
+
+## Broker grant lifecycle, replay rejection, and quota policy PoC — 2026-11-01
+
+### Model
+
+- Added the dependency-free workspace crate `aibe-broker-policy-poc` under `experiments/broker-policy/`; it models Broker policy only and performs no socket, process, or filesystem operations.
+- Each grant is bound to a Broker-issued Renderer instance ID plus PID/UID/GID, a host-issued Origin Group ID, and the exact read-only storage rights set (`LOOKUP | READ | FSTAT`). PID reuse with a new Renderer instance ID is rejected.
+- Grant IDs are monotonically sequenced and scoped to an in-memory registry, preventing accidental cross-registry ID aliasing. They are not cryptographic tokens or durable IDs.
+- Transfer is one-shot: an `Issued` grant becomes `Delegated`; duplicate transfer is rejected as replay. Wrong Renderer, wrong Origin, and rights escalation are rejected without consuming the grant.
+- Global and per-Renderer quotas bound the number of live grant records. Revoking an untransferred grant removes it immediately.
+- Revoking a delegated grant marks all grants for that Renderer `RevocationPending`, blocks further transfer, and returns a `TerminateRenderer` action with the pending-grant count. The registry retains those records and counts against quotas until the supervisor confirms process exit via `release_renderer()`. This avoids silently freeing quota while a process may still hold delegated descriptors.
+
+### Verification
+
+- Broker policy crate: 12/12 tests passed on FreeBSD 15.1.
+- Tests cover read-only grant binding, one-shot/replay behavior, same-PID/new-instance rejection, Origin mismatch, rights escalation, unsupported rights, per-Renderer quota, global quota, two-phase delegated-grant revocation, process-exit cleanup, registry-scoped grant IDs, and invalid quota/identity values.
+- SBOM generation/validation inventory updated from seven to eight workspace crates. Local SBOM generator availability remains subject to the CI supply-chain job; do not claim local artifact generation unless run.
+
+### Limits
+
+- This is an in-memory policy model, not connected to the C `SCM_RIGHTS` PoC or a production Broker. The caller must bind the supplied identity to a kernel-authenticated socket and Broker-owned process handle, execute the returned termination action, and call `release_renderer()` only after process exit is confirmed.
+- No durable grant journal, expiry, cryptographic token, cross-process synchronization, concurrent scheduler, or host-level resource quota exists. `rctl` remains blocked by `kern.racct.enable=0`.

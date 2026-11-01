@@ -17,6 +17,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aibe-broker-policy-poc"
+version = "0.1.0"
+
+[[package]]
 name = "aibe-browser-runtime-origin-poc"
 version = "0.1.0"
 dependencies = [

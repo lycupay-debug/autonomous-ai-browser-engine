@@ -11,6 +11,7 @@ EXPECTED = {
     "aibe-network-policy.cdx.json",
     "aibe-origin-policy.cdx.json",
     "aibe-browser-runtime-origin.cdx.json",
+    "aibe-broker-policy.cdx.json",
 }
 root = Path(__file__).resolve().parents[1] / "sbom"
 found = {path.name for path in root.glob("*.cdx.json")}

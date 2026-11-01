@@ -19,7 +19,8 @@ for entry in \
   "experiments/network-policy/aibe-network-policy-poc.cdx.json:aibe-network-policy.cdx.json" \
   "experiments/control-protocol/uds-poc/aibe-control-protocol-uds-poc.cdx.json:aibe-control-protocol-uds.cdx.json" \
   "experiments/origin-policy/aibe-origin-policy-poc.cdx.json:aibe-origin-policy.cdx.json" \
-  "experiments/browser-runtime/aibe-browser-runtime-origin-poc.cdx.json:aibe-browser-runtime-origin.cdx.json"
+  "experiments/browser-runtime/aibe-browser-runtime-origin-poc.cdx.json:aibe-browser-runtime-origin.cdx.json" \
+  "experiments/broker-policy/aibe-broker-policy-poc.cdx.json:aibe-broker-policy.cdx.json"
 do
   source=${entry%%:*}
   destination=${entry##*:}

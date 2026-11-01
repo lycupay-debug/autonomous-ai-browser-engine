@@ -1,0 +1,625 @@
+//! In-memory Broker grant-policy feasibility model.
+//!
+//! This crate models one-shot descriptor-grant authorization, per-renderer and
+//! global quotas, and the revocation action required by direct FD delegation.
+//! It does not open sockets, pass descriptors, authenticate kernel peers, or
+//! terminate processes. The caller must bind RendererPrincipal to a
+//! Broker-owned process/socketpair and execute TerminateRenderer outcomes.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RendererId(u64);
+
+impl RendererId {
+    /// Creates a Broker-issued process-instance ID. Reusing a PID must create a
+    /// new RendererId so grants from an earlier process cannot be replayed.
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RendererPrincipal {
+    id: RendererId,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl RendererPrincipal {
+    pub const fn new(id: RendererId, pid: u32, uid: u32, gid: u32) -> Option<Self> {
+        if pid == 0 {
+            None
+        } else {
+            Some(Self { id, pid, uid, gid })
+        }
+    }
+
+    pub const fn id(self) -> RendererId {
+        self.id
+    }
+
+    pub const fn pid(self) -> u32 {
+        self.pid
+    }
+
+    pub const fn uid(self) -> u32 {
+        self.uid
+    }
+
+    pub const fn gid(self) -> u32 {
+        self.gid
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OriginGroupId(u64);
+
+impl OriginGroupId {
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GrantId {
+    registry_id: u64,
+    sequence: u64,
+}
+
+impl GrantId {
+    pub const fn value(self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn registry_id(self) -> u64 {
+        self.registry_id
+    }
+}
+
+/// Capability subset supported by this prototype. Storage grants are
+/// intentionally read-only; write/create rights are not currently grantable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageRights(u8);
+
+impl StorageRights {
+    const LOOKUP: u8 = 1 << 0;
+    const READ: u8 = 1 << 1;
+    const FSTAT: u8 = 1 << 2;
+    const WRITE: u8 = 1 << 3;
+    const CREATE: u8 = 1 << 4;
+    const KNOWN: u8 = Self::LOOKUP | Self::READ | Self::FSTAT | Self::WRITE | Self::CREATE;
+
+    pub const READ_ONLY: Self = Self(Self::LOOKUP | Self::READ | Self::FSTAT);
+
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::KNOWN == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantState {
+    Issued,
+    Delegated,
+    RevocationPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaScope {
+    Global,
+    PerRenderer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevocationOutcome {
+    /// The descriptor was not transferred; no Renderer termination is needed.
+    RevokedBeforeTransfer,
+    /// A descriptor was delegated. Closing the Broker's copy cannot revoke it,
+    /// so the caller must terminate this Renderer to remove all process-held FDs.
+    TerminateRenderer {
+        renderer: RendererPrincipal,
+        pending_grants: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrantPermit {
+    id: GrantId,
+    renderer: RendererPrincipal,
+    origin: OriginGroupId,
+    rights: StorageRights,
+}
+
+impl GrantPermit {
+    pub const fn id(self) -> GrantId {
+        self.id
+    }
+
+    pub const fn renderer(self) -> RendererPrincipal {
+        self.renderer
+    }
+
+    pub const fn origin(self) -> OriginGroupId {
+        self.origin
+    }
+
+    pub const fn rights(self) -> StorageRights {
+        self.rights
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantError {
+    InvalidQuota,
+    UnsupportedRights,
+    QuotaExceeded(QuotaScope),
+    UnknownGrant,
+    WrongRenderer,
+    WrongOrigin,
+    RightsMismatch,
+    Replay,
+    TerminationPending,
+    TerminationAlreadyPending,
+    IdExhausted,
+}
+
+impl fmt::Display for GrantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for GrantError {}
+
+#[derive(Clone, Copy, Debug)]
+struct GrantRecord {
+    renderer: RendererPrincipal,
+    origin: OriginGroupId,
+    rights: StorageRights,
+    state: GrantState,
+}
+
+/// A deterministic, in-memory policy registry. IDs are monotonic within this
+/// registry and are not cryptographic tokens or durable identifiers.
+pub struct GrantRegistry {
+    registry_id: u64,
+    next_id: u64,
+    max_total_grants: usize,
+    max_per_renderer: usize,
+    grants: HashMap<GrantId, GrantRecord>,
+}
+
+impl GrantRegistry {
+    pub fn new(max_total_grants: usize, max_per_renderer: usize) -> Result<Self, GrantError> {
+        if max_total_grants == 0 || max_per_renderer == 0 || max_per_renderer > max_total_grants {
+            return Err(GrantError::InvalidQuota);
+        }
+        let registry_id = NEXT_REGISTRY_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| GrantError::IdExhausted)?;
+        Ok(Self {
+            registry_id,
+            next_id: 1,
+            max_total_grants,
+            max_per_renderer,
+            grants: HashMap::new(),
+        })
+    }
+
+    pub fn issue(
+        &mut self,
+        renderer: RendererPrincipal,
+        origin: OriginGroupId,
+        rights: StorageRights,
+    ) -> Result<GrantId, GrantError> {
+        if rights != StorageRights::READ_ONLY {
+            return Err(GrantError::UnsupportedRights);
+        }
+        if self.active_total_count() >= self.max_total_grants {
+            return Err(GrantError::QuotaExceeded(QuotaScope::Global));
+        }
+        if self.active_count_for_renderer(renderer) >= self.max_per_renderer {
+            return Err(GrantError::QuotaExceeded(QuotaScope::PerRenderer));
+        }
+        let id = GrantId {
+            registry_id: self.registry_id,
+            sequence: self.next_id,
+        };
+        self.next_id = self.next_id.checked_add(1).ok_or(GrantError::IdExhausted)?;
+        self.grants.insert(
+            id,
+            GrantRecord {
+                renderer,
+                origin,
+                rights,
+                state: GrantState::Issued,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Consumes a grant exactly once after the Broker has authenticated the
+    /// socket peer and confirmed this process instance is the intended target.
+    pub fn authorize_transfer(
+        &mut self,
+        id: GrantId,
+        renderer: RendererPrincipal,
+        origin: OriginGroupId,
+        requested_rights: StorageRights,
+    ) -> Result<GrantPermit, GrantError> {
+        if id.registry_id != self.registry_id {
+            return Err(GrantError::UnknownGrant);
+        }
+        let record = self.grants.get_mut(&id).ok_or(GrantError::UnknownGrant)?;
+        if record.renderer != renderer {
+            return Err(GrantError::WrongRenderer);
+        }
+        if record.origin != origin {
+            return Err(GrantError::WrongOrigin);
+        }
+        if record.rights != requested_rights {
+            return Err(GrantError::RightsMismatch);
+        }
+        match record.state {
+            GrantState::Issued => record.state = GrantState::Delegated,
+            GrantState::Delegated => return Err(GrantError::Replay),
+            GrantState::RevocationPending => return Err(GrantError::TerminationPending),
+        }
+        Ok(GrantPermit {
+            id,
+            renderer,
+            origin,
+            rights: requested_rights,
+        })
+    }
+
+    /// Revoking an issued grant removes it immediately. Revoking any delegated
+    /// grant marks every grant for that Renderer pending and requires process
+    /// termination before the records and quota can be released.
+    pub fn revoke(&mut self, id: GrantId) -> Result<RevocationOutcome, GrantError> {
+        if id.registry_id != self.registry_id {
+            return Err(GrantError::UnknownGrant);
+        }
+        let record = *self.grants.get(&id).ok_or(GrantError::UnknownGrant)?;
+        match record.state {
+            GrantState::Issued => {
+                self.grants.remove(&id);
+                Ok(RevocationOutcome::RevokedBeforeTransfer)
+            }
+            GrantState::Delegated => {
+                let mut pending_grants = 0;
+                for grant in self.grants.values_mut() {
+                    if grant.renderer == record.renderer {
+                        grant.state = GrantState::RevocationPending;
+                        pending_grants += 1;
+                    }
+                }
+                Ok(RevocationOutcome::TerminateRenderer {
+                    renderer: record.renderer,
+                    pending_grants,
+                })
+            }
+            GrantState::RevocationPending => Err(GrantError::TerminationAlreadyPending),
+        }
+    }
+
+    /// Called only after the supervisor has confirmed that the process exited.
+    pub fn release_renderer(&mut self, renderer: RendererPrincipal) -> usize {
+        let renderer_grants: Vec<GrantId> = self
+            .grants
+            .iter()
+            .filter_map(|(grant_id, grant)| (grant.renderer == renderer).then_some(*grant_id))
+            .collect();
+        let released = renderer_grants.len();
+        for grant_id in renderer_grants {
+            self.grants.remove(&grant_id);
+        }
+        released
+    }
+
+    pub fn state_of(&self, id: GrantId) -> Option<GrantState> {
+        (id.registry_id == self.registry_id)
+            .then(|| self.grants.get(&id).map(|record| record.state))
+            .flatten()
+    }
+
+    pub fn active_count_for_renderer(&self, renderer: RendererPrincipal) -> usize {
+        self.grants
+            .values()
+            .filter(|grant| grant.renderer == renderer)
+            .count()
+    }
+
+    pub fn active_total_count(&self) -> usize {
+        self.grants.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GrantError, GrantRegistry, GrantState, OriginGroupId, RendererId, RendererPrincipal,
+        RevocationOutcome, StorageRights,
+    };
+
+    fn renderer(id: u64, pid: u32) -> RendererPrincipal {
+        RendererPrincipal::new(RendererId::new(id).unwrap(), pid, 1001, 1001).unwrap()
+    }
+
+    fn origin(id: u64) -> OriginGroupId {
+        OriginGroupId::new(id).unwrap()
+    }
+
+    fn registry() -> GrantRegistry {
+        GrantRegistry::new(8, 2).unwrap()
+    }
+
+    #[test]
+    fn grant_is_bound_to_renderer_origin_and_read_only_rights() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let grant = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let permit = registry
+            .authorize_transfer(grant, owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(permit.renderer(), owner);
+        assert_eq!(permit.origin(), origin(10));
+        assert_eq!(permit.rights(), StorageRights::READ_ONLY);
+        assert_eq!(registry.state_of(grant), Some(GrantState::Delegated));
+    }
+
+    #[test]
+    fn transfer_is_one_shot_and_replay_is_rejected() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let grant = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        registry
+            .authorize_transfer(grant, owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.authorize_transfer(grant, owner, origin(10), StorageRights::READ_ONLY),
+            Err(GrantError::Replay)
+        );
+    }
+
+    #[test]
+    fn wrong_renderer_with_reused_pid_is_rejected() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let replacement = renderer(2, 4101);
+        let grant = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.authorize_transfer(grant, replacement, origin(10), StorageRights::READ_ONLY),
+            Err(GrantError::WrongRenderer)
+        );
+        assert_eq!(registry.state_of(grant), Some(GrantState::Issued));
+    }
+
+    #[test]
+    fn wrong_kernel_uid_or_gid_is_rejected() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let wrong_uid =
+            RendererPrincipal::new(RendererId::new(1).unwrap(), 4101, 1002, 1001).unwrap();
+        let wrong_gid =
+            RendererPrincipal::new(RendererId::new(1).unwrap(), 4101, 1001, 1002).unwrap();
+        let grant = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.authorize_transfer(grant, wrong_uid, origin(10), StorageRights::READ_ONLY),
+            Err(GrantError::WrongRenderer)
+        );
+        assert_eq!(
+            registry.authorize_transfer(grant, wrong_gid, origin(10), StorageRights::READ_ONLY),
+            Err(GrantError::WrongRenderer)
+        );
+        assert_eq!(registry.state_of(grant), Some(GrantState::Issued));
+    }
+
+    #[test]
+    fn wrong_origin_and_rights_escalation_are_rejected_without_consuming_grant() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let grant = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.authorize_transfer(grant, owner, origin(11), StorageRights::READ_ONLY),
+            Err(GrantError::WrongOrigin)
+        );
+        let write_rights =
+            StorageRights::from_bits(StorageRights::READ_ONLY.bits() | (1 << 3)).unwrap();
+        assert_eq!(
+            registry.authorize_transfer(grant, owner, origin(10), write_rights),
+            Err(GrantError::RightsMismatch)
+        );
+        assert_eq!(registry.state_of(grant), Some(GrantState::Issued));
+    }
+
+    #[test]
+    fn unsupported_rights_cannot_be_issued() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let write_rights =
+            StorageRights::from_bits(StorageRights::READ_ONLY.bits() | (1 << 3)).unwrap();
+        assert_eq!(
+            registry.issue(owner, origin(10), write_rights),
+            Err(GrantError::UnsupportedRights)
+        );
+        assert_eq!(StorageRights::from_bits(0x80), None);
+    }
+
+    #[test]
+    fn per_renderer_quota_is_enforced_and_revocation_releases_capacity() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let first = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let second = registry
+            .issue(owner, origin(11), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.issue(owner, origin(12), StorageRights::READ_ONLY),
+            Err(GrantError::QuotaExceeded(super::QuotaScope::PerRenderer))
+        );
+        assert_eq!(
+            registry.revoke(first),
+            Ok(RevocationOutcome::RevokedBeforeTransfer)
+        );
+        assert!(
+            registry
+                .issue(owner, origin(12), StorageRights::READ_ONLY)
+                .is_ok()
+        );
+        assert_eq!(registry.state_of(second), Some(GrantState::Issued));
+    }
+
+    #[test]
+    fn global_quota_is_enforced_across_renderers() {
+        let mut registry = GrantRegistry::new(2, 2).unwrap();
+        registry
+            .issue(renderer(1, 4101), origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        registry
+            .issue(renderer(2, 4102), origin(11), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.issue(renderer(3, 4103), origin(12), StorageRights::READ_ONLY),
+            Err(GrantError::QuotaExceeded(super::QuotaScope::Global))
+        );
+    }
+
+    #[test]
+    fn revoking_delegated_grant_requires_terminating_renderer_and_revokes_all_its_grants() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let first = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let second = registry
+            .issue(owner, origin(11), StorageRights::READ_ONLY)
+            .unwrap();
+        registry
+            .authorize_transfer(first, owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(
+            registry.revoke(first),
+            Ok(RevocationOutcome::TerminateRenderer {
+                renderer: owner,
+                pending_grants: 2
+            })
+        );
+        assert_eq!(
+            registry.state_of(first),
+            Some(GrantState::RevocationPending)
+        );
+        assert_eq!(
+            registry.state_of(second),
+            Some(GrantState::RevocationPending)
+        );
+        assert_eq!(registry.active_count_for_renderer(owner), 2);
+        assert_eq!(
+            registry.authorize_transfer(second, owner, origin(11), StorageRights::READ_ONLY),
+            Err(GrantError::TerminationPending)
+        );
+        assert_eq!(
+            registry.revoke(second),
+            Err(GrantError::TerminationAlreadyPending)
+        );
+        assert_eq!(registry.release_renderer(owner), 2);
+        assert_eq!(registry.state_of(first), None);
+        assert_eq!(registry.state_of(second), None);
+        assert_eq!(registry.active_count_for_renderer(owner), 0);
+    }
+
+    #[test]
+    fn renderer_exit_releases_all_grants() {
+        let mut registry = registry();
+        let owner = renderer(1, 4101);
+        let first = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let second = registry
+            .issue(owner, origin(11), StorageRights::READ_ONLY)
+            .unwrap();
+        registry
+            .authorize_transfer(first, owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(registry.release_renderer(owner), 2);
+        assert_eq!(registry.state_of(first), None);
+        assert_eq!(registry.state_of(second), None);
+    }
+
+    #[test]
+    fn grant_ids_are_scoped_to_their_registry() {
+        let mut first_registry = registry();
+        let mut second_registry = registry();
+        let owner = renderer(1, 4101);
+        let first_grant = first_registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let second_grant = second_registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        assert_eq!(first_grant.value(), second_grant.value());
+        assert_ne!(first_grant.registry_id(), second_grant.registry_id());
+        assert_eq!(
+            second_registry.authorize_transfer(
+                first_grant,
+                owner,
+                origin(10),
+                StorageRights::READ_ONLY
+            ),
+            Err(GrantError::UnknownGrant)
+        );
+    }
+
+    #[test]
+    fn invalid_quotas_and_zero_identity_values_are_rejected() {
+        assert_eq!(
+            GrantRegistry::new(0, 1).err(),
+            Some(GrantError::InvalidQuota)
+        );
+        assert_eq!(
+            GrantRegistry::new(1, 2).err(),
+            Some(GrantError::InvalidQuota)
+        );
+        assert_eq!(RendererId::new(0), None);
+        assert_eq!(OriginGroupId::new(0), None);
+        assert_eq!(
+            RendererPrincipal::new(RendererId::new(1).unwrap(), 0, 1, 1),
+            None
+        );
+    }
+}
