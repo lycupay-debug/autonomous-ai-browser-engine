@@ -67,17 +67,17 @@ Do not choose or publish a project license until the owner explicitly approves i
 
 ## Current Cargo and supply-chain status — 2026-11-01
 
-- Current locked workspace metadata after adding the HTML Parser PoC: 223 packages total, comprising nine project-owned workspace crates and 214 third-party packages.
-- All 214 third-party packages declare license metadata in Cargo metadata. This does not constitute legal approval. The nine project-owned PoC crates intentionally have no selected project license; `docs/phase-0/LICENSING_DECISION.md` remains pending.
+- Current locked workspace metadata after adding Snapshot Bridge and Renderer Supervisor: 225 packages total, comprising eleven project-owned workspace crates and 214 third-party packages.
+- All 214 third-party packages declare license metadata in Cargo metadata. This does not constitute legal approval. The eleven project-owned PoC crates intentionally have no selected project license; `docs/phase-0/LICENSING_DECISION.md` remains pending.
 - Added direct dependency `html5ever` 0.40.1 (MIT OR Apache-2.0); its parser/tree-builder dependencies are included in Cargo.lock and Cargo SBOM scope.
-- The SBOM generator and validator now expect nine CycloneDX 1.5 documents: Boa host, Broker policy, Browser Runtime, HTML Parser, UDS control protocol, Headless raster, JS Runtime FFI, Network policy, and Origin policy.
+- The SBOM generator and validator now expect eleven CycloneDX 1.5 documents: Boa host, Broker policy, Browser Runtime, HTML Parser, UDS control protocol, Headless raster, JS Runtime FFI, Network policy, Origin policy, Snapshot Bridge, and Renderer Supervisor.
 - The latest verified CI run (Run `41288165444`) predates the HTML Parser dependency and does not validate this lockfile. A new CI cargo-audit/SBOM run for the HTML Parser commit is required before claiming the updated dependency graph is clean.
-- The checked-in `sbom/` directory currently contains five historical files from an earlier dependency graph. CI regenerates the complete nine-file set and uploads it as a workflow artifact; the five tracked files are not a current complete SBOM set.
+- The checked-in `sbom/` directory currently contains five historical files from an earlier dependency graph. CI regenerates the complete eleven-file set and uploads it as a workflow artifact; the five tracked files are not a current complete SBOM set.
 - Cargo SBOM coverage excludes native FreeBSD packages (V8, SpiderMonkey), base-system libraries, extracted SDK assets, fonts, and the complete host package closure. Those require a separate host/runtime bill of materials.
 - No project-wide license has been selected. License metadata completeness is not permission to redistribute the repository or its assets.
 
 ## 2026-11-01 HTML snapshot serialization dependency update
 
 - `aibe-html-parser-poc` now directly pins `serde_json` 1.0.154 to encode its versioned flat DOM snapshot. This package was already present in the workspace lockfile through existing dependencies; the direct declaration does not add a new resolved package version.
-- The workspace SBOM generator already enumerates all nine workspace crates, including the HTML Parser. The tracked five-file SBOM directory remains historical/incomplete until the supply-chain CI regenerates and validates all nine documents for the current commit.
-- The current change must pass the workflow's `cargo-audit` 0.22.2 scan and nine-crate CycloneDX 1.5 generation/validation before the updated dependency graph is called clean/current.
+- The previous SBOM generator enumerated nine workspace crates but omitted the newly added Snapshot Bridge and Renderer Supervisor crates. A review of the successful PR #7 supply-chain job found that the validator still passed because those two generated BOMs were left outside `sbom/` and never uploaded. This was a coverage gap, not a dependency-scan success for the complete workspace.
+- Updated the generator and validator to include all eleven workspace crates. The new eleven-file SBOM set and cargo-audit result remain pending the updated GitHub Actions run; do not mark the updated dependency graph clean/current until that run succeeds.

@@ -607,3 +607,60 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - The endpoint sets finite five-second read/write timeouts. The grant is consumed before writing to avoid replay after partial delivery. Revoking an unconsumed grant blocks transfer; a grant consumed for a send attempt is reported as `AlreadyConsumed`. The registry cannot recall bytes that may already have reached Renderer memory and does not infer whether a failed write delivered a partial frame.
 - This is a dedicated testable authorization gate, not yet the production Broker accept loop. Renderer process registration, Origin/Document grant issuance and teardown remain caller-owned; there is no PID-reuse supervisor lifecycle, request-ID replay cache, SCM_RIGHTS binding or live NavigationController ownership integration.
 - FreeBSD verification: UDS 27/27 unit + 8/8 independent-process integration tests; the independent-process integration suite also passed 20/20 repeated runs; Broker policy 18/18; Browser Runtime 39/39; Boa 7/7; Headless 4/4; HTML Parser 10/10; V8 FFI 22/22; Network Policy 27/27; Origin Policy 17/17. Full workspace: **179/179 passed**. Rustfmt, Workspace Clippy (`-D warnings`), `git diff --check`, and `scripts/run-security-pocs.sh` passed.
+
+
+## Incremental R&D record｜2026-11-01（Renderer Supervisor、request replay guard 与 V8 Snapshot ingestion）
+
+### 目标
+
+把此前 Browser Runtime → Broker → UDS → Renderer 的单次数据传输 PoC 推进到真实进程生命周期管理，并验证 Renderer 收到的 Snapshot 可以进入独立 V8 Runtime。同步复核阶段 0 既有供应链 CI 覆盖范围，避免新 workspace crate 未进入 SBOM。
+
+### 实施内容
+
+- 新增 `aibe-renderer-supervisor-poc` workspace crate。Supervisor 创建 owner-only UDS endpoint、启动 Renderer 子进程、读取 FreeBSD kernel peer PID/UID/GID，并将身份绑定到 Broker 签发的 RendererPrincipal；调用方不能自行提供 Principal。
+- Supervisor 持有 Child 与已认证 UnixStream；accept 有限 deadline，连接有 5 秒读写 timeout。拒绝非目标 PID 的本地 peer，成功 accept 后移除 socket filesystem path。
+- 增加 `poll_exits`、`terminate`、`shutdown` 生命周期路径。只有确认子进程退出后才释放 Storage Grant、Snapshot Grant 和请求历史；replacement Renderer 获得新的实例 ID，不能继承旧进程 grant。
+- 增加每个 Renderer 的非零 request ID replay guard。默认全局上限 4096、每 Renderer 上限 256；配额可配置并拒绝零值/不合法组合。重复 ID 在新 grant 签发和第二帧写入之前拒绝。即使写入状态不确定，请求 ID 仍保留到 Renderer 退出，避免部分交付后的重放。
+- 新增 `send_supervised_document_snapshot()`，将请求预留、Supervisor 持有的已认证连接、当前 Document Snapshot 和一次性 Broker grant 串成单一调用路径。
+- Renderer 辅助进程现在在 FreeBSD 上创建独立 V8 Runtime / Origin / Document Realm，从 Snapshot 重建 generic native Node-wrapper graph，重建 parent/child 与 template-content 引用，验证节点数量、Document Element、树关系和 wrapper identity，然后执行 GC 并销毁 Realm。
+- Snapshot 的 node type/name/value/attributes 目前作为 JavaScript-side metadata 保存；尚不是 typed native DOM storage、标准 Document/Element/Text 接口或 Web IDL。
+- 复核发现此前 SBOM generator/validator 只列出九个 crate，遗漏 Snapshot Bridge 和 Renderer Supervisor。此前 PR #7 的 supply-chain job 虽然显示成功，但新生成的两个 BOM 未移动到上传目录，因此不代表完整 11-crate 覆盖。已修复 generator/validator，将预期集合扩展到全部 11 个 workspace crates。
+
+### FreeBSD 15.1-RELEASE-p6 amd64 验证
+
+- 完整 Workspace：**186/186 passed**。
+- Snapshot Bridge：3/3 unit tests；Supervisor + Renderer 独立进程集成：2/2 passed。
+- 集成测试覆盖真实 PID 绑定、请求 ID 重放拒绝、零 ID 拒绝、全局/per-Renderer 配额、进程退出 grant 清理、replacement instance、主动终止和 shutdown。
+- Supervisor / Renderer 两个集成测试连续执行 20 轮：**40/40 executions passed**。
+- Renderer 子进程实际运行 V8 Snapshot ingestion；V8 Runtime 创建、Document Realm 初始化、Node-wrapper graph 构造、身份检查、GC 与 Realm teardown 均在独立进程中执行并通过。
+- Rustfmt：passed。
+- Workspace Clippy（all targets/all features，`-D warnings`）：passed。
+- `git diff --check`：passed。
+- `scripts/run-security-pocs.sh`：passed，覆盖 Capsicum FD rights、Broker/Renderer IPC、UDS peer credentials、per-Origin storage capability、malformed SCM_RIGHTS FD cleanup、Renderer crash recovery、Jail IPv4 isolation。
+- Pinned Test262 synchronous subset：V8 284/284 passed；SpiderMonkey 284/284 passed。该子集不代表完整 Test262 conformance。
+- Live Network Policy：example.com HTTPS GET 200 / 577 bytes；httpbin redirect 302 → 200 / 240 bytes。
+- Live fetch-to-parser pipeline：example.com 577 bytes，HTML Parser 输出 16 nodes、title `Example Domain`、0 parse errors。
+- Cargo metadata：225 packages total、11 workspace crates、214 third-party packages；214 个第三方包均有 license metadata。该结果不是法律许可审查。
+
+### GitHub / CI / 当前工作树
+
+- 基线 PR #7：<https://github.com/lycupay-debug/autonomous-ai-browser-engine/pull/7>，分支 `work/renderer-supervisor-lifecycle`，commit `837ee6c9fa7111b44ea831307dfcee087617f984`。
+- PR #7 原有 Rust 与 supply-chain checks 曾显示成功；复核确认其 SBOM generator/validator 只覆盖九个 crate，漏掉 Snapshot Bridge 与 Renderer Supervisor。该缺口已在当前工作树修复，但修复后的 CI 尚未运行。
+- 当前分支工作树包含 Supervisor 异常路径收紧、request replay guard、V8 Snapshot ingestion、README/阶段文档及 11-crate SBOM inventory 修复；尚未提交或推送。
+- 本轮仅在隔离 worktree 中编译、测试和运行临时 PoC；未部署服务、未启用 rc.d、未修改 sysctl/持久系统配置、未重启主机或生产服务。
+
+### 结论与限制
+
+- **已实施并在 FreeBSD 本机验证：** Renderer PID/UID/GID 与 Broker-issued instance identity 绑定；Supervisor 管理子进程、连接和 grant cleanup；请求重放与配额防护；真实独立 Renderer 进程完成 V8 Native Node-wrapper graph ingestion。
+- **仍为 Phase 0 PoC：** 不是 production Broker daemon、多 Renderer 并发调度服务或完整 Renderer sandbox；没有对 Renderer 实施 Capsicum、Jail、rctl、独立低权限账户或完整 descriptor inheritance policy。
+- **尚未实现：** typed native DOM node/attribute/text state、live DOM mutation、Web IDL、HTML Event Loop、SCM_RIGHTS 与 Snapshot grant 的统一授权、真实 Network Service → Parser → Document → Renderer 连续导航闭环、CSS/Layout/Paint、WPT 和真实网站交互测试。
+- request replay guard 是当前 Supervisor 实例内存状态；不提供 Broker 重启后的持久幂等结果缓存。其 at-most-once 拒绝语义刻意不重试不确定的部分写入。
+- 11-crate SBOM / cargo-audit 的更新后 CI 仍待执行；不能沿用旧 PR 的 supply-chain success 声称当前 lockfile 已完成审计。
+
+### 下一步
+
+1. 提交并推送当前修订，重新运行 Rust、cargo-audit 和 11-crate CycloneDX SBOM CI；核对上传 artifact 中确有全部 11 个 crate。
+2. 增加 UDS peer mismatch、Renderer 在 Snapshot transfer 中退出、partial frame、并发 duplicate request、accept 异常连接和所有错误分支 cleanup 测试。
+3. 将 generic Node metadata 迁移到 typed native node storage，补充属性、文本、Document/Element 语义和 live mutation。
+4. 研究 Renderer 的真实 sandbox 配置：descriptor close-on-exec、Capsicum rights、Jail/resource limits、独立身份与 network broker；先在隔离实验中验证，不修改主机持久配置。
+5. 完成 Snapshot / Renderer 生命周期与 Navigation Document teardown 的自动联动，再评估阶段 0 退出条件。

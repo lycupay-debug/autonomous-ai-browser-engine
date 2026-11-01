@@ -1,0 +1,9 @@
+[package]
+name = "aibe-renderer-supervisor-poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+aibe-broker-policy-poc = { path = "../broker-policy" }
+aibe-control-protocol-uds-poc = { path = "../control-protocol/uds-poc" }

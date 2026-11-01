@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["experiments/broker-policy", "experiments/browser-runtime", "experiments/origin-policy", "experiments/html-parser", "experiments/js-runtime/boa-host", "experiments/headless/raster-poc", "experiments/network-policy", "experiments/control-protocol/uds-poc", "experiments/js-runtime/ffi-poc", "experiments/snapshot-bridge"]
+members = ["experiments/broker-policy", "experiments/browser-runtime", "experiments/origin-policy", "experiments/html-parser", "experiments/js-runtime/boa-host", "experiments/headless/raster-poc", "experiments/network-policy", "experiments/control-protocol/uds-poc", "experiments/js-runtime/ffi-poc", "experiments/snapshot-bridge", "experiments/renderer-supervisor"]
 
 [workspace.package]
 edition = "2024"
