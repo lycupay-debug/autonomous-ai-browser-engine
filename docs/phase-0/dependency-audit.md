@@ -49,7 +49,7 @@ Do not choose or publish a project license until the owner explicitly approves i
 - Generator: `cargo-cyclonedx` 0.5.9 (`--locked` installation).
 - Format: CycloneDX JSON 1.5.
 - Artifacts: `sbom/aibe-boa-host.cdx.json`, `sbom/aibe-control-protocol-uds.cdx.json`, `sbom/aibe-headless-raster.cdx.json`, `sbom/aibe-js-runtime-ffi.cdx.json`, and `sbom/aibe-network-policy.cdx.json`.
-- Component counts: 146, 5, 45, 3, and 53 respectively.
+- Component counts before font-stack remediation: 146, 5, 45, 3, and 53 respectively. The refreshed 2026-11-01 SBOM set contains 146, 5, 37, 3, and 53 components respectively.
 - The SBOMs cover each Cargo crate's resolved dependency graph, not native packages, system libraries, fonts, or the complete host OS package closure.
 
 ## 2026-11-01 RustSec remediation and font stack maintenance
