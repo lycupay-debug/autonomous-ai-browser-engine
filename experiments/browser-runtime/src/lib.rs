@@ -4,6 +4,8 @@
 //! JavaScript Runtime origin handles. The URL parser is not part of the V8
 //! adapter, and page JavaScript cannot request or manufacture these grants.
 
+pub mod navigation;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -265,6 +267,8 @@ mod tests {
         next_realm: u64,
         realms: HashMap<MockRealm, MockOrigin>,
         fail_next_realm: bool,
+        fail_on_realm: Option<u64>,
+        fail_destroy_realm_once: Option<u64>,
     }
 
     impl OriginRealmRuntime for MockRuntime {
@@ -281,17 +285,22 @@ mod tests {
             &mut self,
             origin: Self::Origin,
         ) -> Result<Self::Realm, Self::Error> {
-            if self.fail_next_realm {
+            let candidate_realm = self.next_realm + 1;
+            if self.fail_next_realm || self.fail_on_realm == Some(candidate_realm) {
                 self.fail_next_realm = false;
                 return Err(MockError);
             }
-            self.next_realm += 1;
+            self.next_realm = candidate_realm;
             let realm = MockRealm(self.next_realm);
             self.realms.insert(realm, origin);
             Ok(realm)
         }
 
         fn destroy_realm(&mut self, realm: Self::Realm) -> Result<(), Self::Error> {
+            if self.fail_destroy_realm_once == Some(realm.0) {
+                self.fail_destroy_realm_once = None;
+                return Err(MockError);
+            }
             self.realms.remove(&realm).ok_or(MockError)?;
             Ok(())
         }
@@ -404,6 +413,215 @@ mod tests {
             .unwrap();
         assert_eq!(coordinator.active_origin_group_count(), 1);
         assert!(coordinator.origin_group_for_realm(retry).is_some());
+    }
+
+    #[test]
+    fn root_navigation_commit_replaces_document_only_at_commit() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller
+            .create_root_frame("https://a.example/start")
+            .unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        let original_origin = controller.document(original).unwrap().origin();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/next", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(controller.current_document_id(frame), Some(original));
+        assert_eq!(
+            controller.document(original).unwrap().origin(),
+            original_origin
+        );
+        assert_eq!(controller.pending_navigation_count(), 1);
+        let committed = controller.commit_navigation(navigation).unwrap();
+        assert_ne!(committed, original);
+        assert_eq!(controller.current_document_id(frame), Some(committed));
+        assert_eq!(
+            controller.document(committed).unwrap().url(),
+            "https://b.example/next"
+        );
+        assert_ne!(
+            controller.document(committed).unwrap().origin(),
+            original_origin
+        );
+        assert!(controller.document(original).is_none());
+        assert_eq!(controller.pending_navigation_count(), 0);
+    }
+
+    #[test]
+    fn abort_preserves_current_document_and_releases_candidate_realm() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(controller.coordinator().active_origin_group_count(), 2);
+        controller.abort_navigation(navigation).unwrap();
+        assert_eq!(controller.current_document_id(frame), Some(original));
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+        assert_eq!(controller.pending_navigation_count(), 0);
+    }
+
+    #[test]
+    fn redirect_replaces_candidate_origin_and_enforces_limit() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        let mut controller =
+            NavigationController::with_redirect_limit(MockRuntime::default(), 1).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        controller
+            .redirect(navigation, "https://c.example/final")
+            .unwrap();
+        assert!(matches!(
+            controller.redirect(navigation, "https://d.example/"),
+            Err(NavigationError::RedirectLimit)
+        ));
+        let document = controller.commit_navigation(navigation).unwrap();
+        assert_eq!(
+            controller.document(document).unwrap().url(),
+            "https://c.example/final"
+        );
+    }
+
+    #[test]
+    fn starting_new_navigation_cancels_previous_candidate() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let first = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let second = controller
+            .begin_navigation(frame, "https://c.example/", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(controller.pending_navigation_count(), 1);
+        assert!(controller.abort_navigation(first).is_err());
+        let document = controller.commit_navigation(second).unwrap();
+        assert_eq!(
+            controller.document(document).unwrap().url(),
+            "https://c.example/"
+        );
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn inherited_and_sandboxed_child_frames_have_distinct_origin_semantics() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let inherited = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Inherited)
+            .unwrap();
+        let sandboxed = controller
+            .create_child_frame(root, "https://a.example/frame", NavigationMode::Sandboxed)
+            .unwrap();
+        let root_doc = controller
+            .document(controller.current_document_id(root).unwrap())
+            .unwrap();
+        let inherited_doc = controller
+            .document(controller.current_document_id(inherited).unwrap())
+            .unwrap();
+        let sandboxed_doc = controller
+            .document(controller.current_document_id(sandboxed).unwrap())
+            .unwrap();
+        assert_eq!(root_doc.origin(), inherited_doc.origin());
+        assert_ne!(root_doc.realm(), inherited_doc.realm());
+        assert_ne!(root_doc.origin(), sandboxed_doc.origin());
+        assert_eq!(controller.frame_parent(inherited), Some(root));
+        assert_eq!(controller.frame_children(root).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_candidate_realm_creation_keeps_current_document() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        let runtime = MockRuntime {
+            fail_on_realm: Some(2),
+            ..MockRuntime::default()
+        };
+        let mut controller = NavigationController::new(runtime).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        assert!(matches!(
+            controller.begin_navigation(frame, "https://b.example/", NavigationMode::Url),
+            Err(NavigationError::Coordinator(_))
+        ));
+        assert_eq!(controller.current_document_id(frame), Some(original));
+        assert_eq!(controller.pending_navigation_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn detaching_frame_recursively_releases_documents_and_pending_navigation() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let child = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Inherited)
+            .unwrap();
+        let grandchild = controller
+            .create_child_frame(child, "https://other.example/", NavigationMode::Sandboxed)
+            .unwrap();
+        let pending = controller
+            .begin_navigation(child, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(controller.detach_frame(root).unwrap(), 3);
+        assert_eq!(controller.active_frame_count(), 0);
+        assert_eq!(controller.active_document_count(), 0);
+        assert_eq!(controller.pending_navigation_count(), 0);
+        assert!(controller.abort_navigation(pending).is_err());
+        assert!(controller.frame_children(root).is_none());
+        assert!(controller.frame_parent(grandchild).is_none());
+        assert_eq!(controller.coordinator().active_origin_group_count(), 0);
+    }
+
+    #[test]
+    fn inherited_origin_mode_rejects_non_about_urls() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        assert!(matches!(
+            controller.create_child_frame(root, "https://evil.example/", NavigationMode::Inherited),
+            Err(NavigationError::InheritedOriginRequiresAboutUrl)
+        ));
+        assert!(matches!(
+            controller.begin_navigation(root, "https://evil.example/", NavigationMode::Inherited),
+            Err(NavigationError::InheritedOriginRequiresAboutUrl)
+        ));
+        let child = controller
+            .create_child_frame(root, "about:blank#fragment", NavigationMode::Inherited)
+            .unwrap();
+        assert_eq!(controller.frame_parent(child), Some(root));
+        assert_eq!(controller.active_frame_count(), 2);
+    }
+
+    #[test]
+    fn failed_old_realm_destruction_keeps_navigation_retryable() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        let runtime = MockRuntime {
+            fail_destroy_realm_once: Some(1),
+            ..MockRuntime::default()
+        };
+        let mut controller = NavigationController::new(runtime).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        assert!(matches!(
+            controller.commit_navigation(navigation),
+            Err(NavigationError::Coordinator(_))
+        ));
+        assert_eq!(controller.current_document_id(frame), Some(original));
+        assert_eq!(controller.active_document_count(), 1);
+        assert_eq!(controller.pending_navigation_count(), 1);
+        let committed = controller.commit_navigation(navigation).unwrap();
+        assert_ne!(committed, original);
+        assert_eq!(controller.pending_navigation_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
     }
 
     #[test]
