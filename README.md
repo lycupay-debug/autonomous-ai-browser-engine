@@ -24,6 +24,7 @@ The current V8 FFI PoC models host-issued origin groups separately from JavaScri
 - `experiments/js-runtime/boa-host/`: Boa embedding, DOM/JS lifecycle, Test262 subset and script runner PoCs.
 - `experiments/js-runtime/native-embed/`: FreeBSD V8 and SpiderMonkey C++ embedding PoCs.
 - `experiments/js-runtime/ffi-poc/`: Rust-owned RAII wrappers over native V8 and SpiderMonkey C ABI.
+- `experiments/origin-policy/`: host-owned URL-origin canonicalization and opaque origin-group registry PoC.
 - `experiments/js-runtime/benchmarks/`: common cross-runtime JavaScript microbenchmark.
 - `experiments/security/`: FreeBSD Capsicum, per-origin storage descriptor, crash-recovery, peer-credential and Jail network-isolation PoCs.
 - `experiments/headless/raster-poc/`: OpenType shaping, CPU glyph rasterization and PNG/JPEG/GIF/WebP decode PoC.

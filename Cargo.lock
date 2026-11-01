@@ -50,6 +50,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aibe-origin-policy-poc"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
 name = "aligned-vec"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

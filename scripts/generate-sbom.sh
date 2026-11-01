@@ -17,7 +17,8 @@ for entry in \
   "experiments/js-runtime/ffi-poc/aibe-js-runtime-ffi-poc.cdx.json:aibe-js-runtime-ffi.cdx.json" \
   "experiments/headless/raster-poc/aibe-headless-raster-poc.cdx.json:aibe-headless-raster.cdx.json" \
   "experiments/network-policy/aibe-network-policy-poc.cdx.json:aibe-network-policy.cdx.json" \
-  "experiments/control-protocol/uds-poc/aibe-control-protocol-uds-poc.cdx.json:aibe-control-protocol-uds.cdx.json"
+  "experiments/control-protocol/uds-poc/aibe-control-protocol-uds-poc.cdx.json:aibe-control-protocol-uds.cdx.json" \
+  "experiments/origin-policy/aibe-origin-policy-poc.cdx.json:aibe-origin-policy.cdx.json"
 do
   source=${entry%%:*}
   destination=${entry##*:}

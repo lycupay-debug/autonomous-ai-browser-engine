@@ -260,3 +260,31 @@ Separate JavaScript Realm identity from the host's same-origin grouping decision
 2. Test hostile wrapper transfer, nested callbacks, event listeners, and stale wrappers after Realm destruction.
 3. Define Document/Frame/Agent ownership and decide which origin-group handles may be shared across contexts/processes.
 4. Continue the independent Renderer Sandbox work: process separation, Capsicum FD rights, Jail network denial, rctl, IPC authentication, and crash recovery.
+
+
+## Host URL Origin canonicalization PoC — 2026-11-01
+
+### Scope
+
+Added an independent Rust experiment under `experiments/origin-policy/`. URL parsing and origin calculation belong to the trusted browser host, not page JavaScript or the V8 adapter. The crate uses the workspace-pinned `url = 2.5.8` implementation and keeps the resulting group handles separate from `JsOriginId`; a future Browser Runtime layer must explicitly map the host registry handle to the selected JS Runtime's opaque origin handle.
+
+### Behavior
+
+- Tuple origins are interned using the URL library's WHATWG-compatible origin calculation: scheme, canonical host, and effective port; path, query, fragment, and userinfo do not affect origin identity.
+- Default ports, host case, IDNA names, IPv4 normalization, and IPv6 textual variants are covered by tests.
+- `blob:` URLs inherit the parsed inner URL's origin.
+- Opaque origins are unique per creation, including repeated parsing of the same `data:`, `about:blank`, or `file:` URL text. `file:` is treated conservatively as opaque because its origin behavior is implementation-defined.
+- Inherited origins are explicit: `inherit(parent)` propagates a creator's group; parsing `about:blank` alone creates a fresh opaque origin and does not infer an opener/creator relationship.
+- Sandboxed documents can receive a fresh opaque group. Registry handles cannot be validated by another registry.
+
+### Verification
+
+- Origin policy unit tests: 13/13 passed on FreeBSD 15.1-RELEASE-p6.
+- Dependency was already present in `Cargo.lock` as `url 2.5.8`; workspace lock metadata updated offline, without fetching or changing the dependency version.
+- This crate has not yet been wired into a Browser/Frame/Navigation runtime. It does not yet handle inherited-origin navigation, sandbox flags, `document.domain`, agent clusters, or process/site isolation.
+
+### Security boundary
+
+- The registry handle is an internal host grouping token, not a user-visible serialization and not a cryptographic secret.
+- Never derive an authorization grant from untrusted page content. The trusted navigation/Document lifecycle must decide when a URL's computed origin is inherited, replaced, or forced opaque.
+- This is a Phase 0 origin primitive, not a complete browser Same-Origin Policy implementation.
