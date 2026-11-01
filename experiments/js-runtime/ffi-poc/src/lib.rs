@@ -23,7 +23,8 @@ pub enum JsValue {
 /// Project-owned JavaScript Runtime boundary. Implementations must not expose
 /// engine-specific handles or types. The Phase 0 contract supports typed
 /// primitive results, stringified evaluation, and explicit host checkpoints.
-/// Object handles, callbacks, and browser-agent scheduling remain later work.
+/// Object handles, engine-neutral callbacks, and browser-agent scheduling remain later work.
+/// The V8 adapter has a separate opt-in Realm-scoped host-callback feasibility API.
 ///
 /// No `Send` or `Sync` bound is imposed: the selected V8 isolate is thread-affine.
 pub trait JsRuntime {
@@ -73,10 +74,14 @@ impl From<i32> for JsRuntimeError {
 
 #[cfg(target_os = "freebsd")]
 mod native {
+    use std::cell::{Cell, RefCell};
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
     use std::marker::PhantomData;
-    use std::ptr::NonNull;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr::{self, NonNull};
     use std::rc::Rc;
+    use std::slice;
+    use std::str;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +100,108 @@ mod native {
     const JS_VALUE_TAG_NUMBER: c_int = 3;
     const JS_VALUE_TAG_STRING: c_int = 4;
     const JS_VALUE_TAG_UNSUPPORTED: c_int = 5;
+
+    type HostCallbackFn = dyn FnMut(&str) -> Result<String, String>;
+
+    struct HostCallbackState {
+        callback: RefCell<Box<HostCallbackFn>>,
+        active: Cell<bool>,
+    }
+
+    struct HostCallbackActiveGuard<'a>(&'a Cell<bool>);
+
+    impl Drop for HostCallbackActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
+
+    unsafe fn write_host_callback_output(
+        output: *mut u8,
+        output_capacity: usize,
+        output_length: *mut usize,
+        bytes: &[u8],
+    ) -> bool {
+        if output_length.is_null()
+            || bytes.len() > output_capacity
+            || (!bytes.is_empty() && output.is_null())
+        {
+            return false;
+        }
+        unsafe {
+            *output_length = bytes.len();
+            if !bytes.is_empty() {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
+            }
+        }
+        true
+    }
+
+    unsafe extern "C" fn host_callback_dispatch(
+        user_data: *mut c_void,
+        input: *const u8,
+        input_length: usize,
+        output: *mut u8,
+        output_capacity: usize,
+        output_length: *mut usize,
+    ) -> c_int {
+        if user_data.is_null() || (input.is_null() && input_length != 0) || output_length.is_null()
+        {
+            return -1;
+        }
+        unsafe {
+            *output_length = 0;
+        }
+        let state = unsafe { &*(user_data.cast::<HostCallbackState>()) };
+        if state.active.replace(true) {
+            let message = b"reentrant host callback rejected";
+            let written = unsafe {
+                write_host_callback_output(output, output_capacity, output_length, message)
+            };
+            return if written { -3 } else { -4 };
+        }
+        let _active_guard = HostCallbackActiveGuard(&state.active);
+
+        let input_bytes = if input_length == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(input, input_length) }
+        };
+        let input = match str::from_utf8(input_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                let message = b"host callback input is not valid UTF-8";
+                let written = unsafe {
+                    write_host_callback_output(output, output_capacity, output_length, message)
+                };
+                return if written { -2 } else { -4 };
+            }
+        };
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut callback = state
+                .callback
+                .try_borrow_mut()
+                .map_err(|_| "reentrant host callback rejected".to_string())?;
+            callback(input)
+        }));
+        let (status, message) = match result {
+            Ok(Ok(value)) => (0, value),
+            Ok(Err(error)) => (1, error),
+            Err(_) => (2, "host callback panicked".to_string()),
+        };
+        if unsafe {
+            write_host_callback_output(output, output_capacity, output_length, message.as_bytes())
+        } {
+            status
+        } else {
+            let fallback = b"host callback response exceeds the 16 KiB limit";
+            let _ = unsafe {
+                write_host_callback_output(output, output_capacity, output_length, fallback)
+            };
+            -4
+        }
+    }
 
     struct RawJsValueResult {
         status: i32,
@@ -118,6 +225,25 @@ mod native {
         ) -> c_int;
         fn aibe_v8_create_realm(handle: *mut c_void, realm_id: *mut u64) -> c_int;
         fn aibe_v8_destroy_realm(handle: *mut c_void, realm_id: u64) -> c_int;
+        fn aibe_v8_install_host_callback(
+            handle: *mut c_void,
+            realm_id: u64,
+            callback: unsafe extern "C" fn(
+                *mut c_void,
+                *const u8,
+                usize,
+                *mut u8,
+                usize,
+                *mut usize,
+            ) -> c_int,
+            user_data: *mut c_void,
+        ) -> c_int;
+        #[cfg(test)]
+        fn aibe_v8_host_callback_cross_realm_probe(
+            handle: *mut c_void,
+            grant_realm_id: u64,
+            caller_realm_id: u64,
+        ) -> c_int;
         fn aibe_v8_eval_value_in_realm(
             handle: *mut c_void,
             realm_id: u64,
@@ -170,6 +296,8 @@ mod native {
     pub struct V8Runtime {
         handle: NonNull<c_void>,
         runtime_id: u64,
+        host_callback_state: Option<Box<HostCallbackState>>,
+        host_callback_realm_id: Option<u64>,
         _thread_affinity: PhantomData<Rc<()>>,
     }
 
@@ -188,6 +316,8 @@ mod native {
                 .map(|handle| Self {
                     handle,
                     runtime_id,
+                    host_callback_state: None,
+                    host_callback_realm_id: None,
                     _thread_affinity: PhantomData,
                 })
                 .ok_or("V8 initialization failed")
@@ -219,10 +349,78 @@ mod native {
             }
             let status = unsafe { aibe_v8_destroy_realm(self.handle.as_ptr(), realm.realm_id) };
             if status == 0 {
+                if self.host_callback_realm_id == Some(realm.realm_id) {
+                    self.host_callback_state = None;
+                    self.host_callback_realm_id = None;
+                }
                 Ok(())
             } else {
                 Err(status.into())
             }
+        }
+
+        /// Explicitly grants one Realm a bounded host callback capability.
+        /// The callback is not injected into the default/page Context unless
+        /// that Realm is deliberately selected by the caller.
+        pub fn install_host_callback<F>(
+            &mut self,
+            realm: super::JsRealmId,
+            callback: F,
+        ) -> Result<(), super::JsRuntimeError>
+        where
+            F: FnMut(&str) -> Result<String, String> + 'static,
+        {
+            if realm.runtime_id != self.runtime_id {
+                return Err((-14).into());
+            }
+            if self.host_callback_state.is_some() {
+                return Err((-15).into());
+            }
+            let mut state = Box::new(HostCallbackState {
+                callback: RefCell::new(Box::new(callback)),
+                active: Cell::new(false),
+            });
+            let user_data = (&mut *state as *mut HostCallbackState).cast::<c_void>();
+            let status = unsafe {
+                aibe_v8_install_host_callback(
+                    self.handle.as_ptr(),
+                    realm.realm_id,
+                    host_callback_dispatch,
+                    user_data,
+                )
+            };
+            if status != 0 {
+                return Err(status.into());
+            }
+            self.host_callback_state = Some(state);
+            self.host_callback_realm_id = Some(realm.realm_id);
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub fn host_callback_cross_realm_probe(
+            &mut self,
+            grant: super::JsRealmId,
+            caller: super::JsRealmId,
+        ) -> i32 {
+            if grant.runtime_id != self.runtime_id || caller.runtime_id != self.runtime_id {
+                return -14;
+            }
+            unsafe {
+                aibe_v8_host_callback_cross_realm_probe(
+                    self.handle.as_ptr(),
+                    grant.realm_id,
+                    caller.realm_id,
+                )
+            }
+        }
+
+        #[cfg(test)]
+        pub fn host_callback_state_pointer_for_test(&mut self) -> *mut c_void {
+            self.host_callback_state
+                .as_deref_mut()
+                .map(|state| (state as *mut HostCallbackState).cast())
+                .unwrap_or(ptr::null_mut())
         }
 
         pub fn eval_value_in_realm(
@@ -401,6 +599,27 @@ mod native {
                 )
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn invoke_host_callback_dispatch_for_test(
+        user_data: *mut c_void,
+        input: &str,
+    ) -> (c_int, String) {
+        let mut output = [0_u8; 128];
+        let mut output_length = 0_usize;
+        let status = unsafe {
+            host_callback_dispatch(
+                user_data,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut output_length,
+            )
+        };
+        let message = String::from_utf8_lossy(&output[..output_length]).into_owned();
+        (status, message)
     }
 
     impl Drop for V8Runtime {
@@ -598,6 +817,166 @@ mod tests {
             runtime.eval_value("NaN").unwrap(),
             super::JsValue::Number(value) if value.is_nan()
         ));
+    }
+
+    #[test]
+    fn v8_realm_host_callback_is_explicitly_granted_and_preserves_utf8_nul() {
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let realm = runtime.create_realm().expect("Realm is created");
+        runtime
+            .install_host_callback(realm, |input| Ok(format!("reply:{input}")))
+            .expect("host callback is granted to the selected Realm");
+
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(realm, "hostCall('A\\u0000B')")
+                .unwrap(),
+            super::JsValue::String("reply:A\0B".to_string())
+        );
+        assert_eq!(
+            runtime.eval_value("typeof hostCall").unwrap(),
+            super::JsValue::String("undefined".to_string()),
+            "the default Context must not receive the host capability"
+        );
+        let other_realm = runtime.create_realm().expect("second Realm is created");
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(other_realm, "typeof hostCall")
+                .unwrap(),
+            super::JsValue::String("undefined".to_string()),
+            "the callback is not ambient in other Realms"
+        );
+        assert_eq!(
+            runtime
+                .install_host_callback(other_realm, |_| Ok("second callback".to_string()))
+                .unwrap_err()
+                .code,
+            -15,
+            "a Runtime accepts only one active host callback capability"
+        );
+        let oversized_input = format!("hostCall('{}')", "x".repeat(16 * 1024 + 1));
+        let input_limit_error = runtime
+            .eval_value_in_realm(realm, &oversized_input)
+            .unwrap_err();
+        assert!(
+            input_limit_error
+                .message
+                .contains("input exceeds the 16 KiB limit")
+        );
+        let argument_error = runtime
+            .eval_value_in_realm(realm, "hostCall()")
+            .unwrap_err();
+        assert!(
+            argument_error
+                .message
+                .contains("exactly one string argument")
+        );
+
+        runtime
+            .destroy_realm(realm)
+            .expect("destroying the granted Realm clears the callback capability");
+        let replacement = runtime
+            .create_realm()
+            .expect("replacement Realm is created");
+        runtime
+            .install_host_callback(replacement, |input| Ok(input.to_uppercase()))
+            .expect("callback state can be safely reinstalled after Realm teardown");
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(replacement, "hostCall('ready')")
+                .unwrap(),
+            super::JsValue::String("READY".to_string())
+        );
+    }
+
+    #[test]
+    fn v8_realm_host_callback_converts_errors_and_contains_panics() {
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let realm = runtime.create_realm().expect("Realm is created");
+        runtime
+            .install_host_callback(realm, |input| match input {
+                "failure" => Err("expected host callback failure".to_string()),
+                "panic" => panic!("test panic must not cross the C ABI"),
+                "oversize" => Ok("x".repeat(16 * 1024 + 1)),
+                other => Ok(other.to_uppercase()),
+            })
+            .expect("host callback is installed");
+
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(
+                    realm,
+                    "try { hostCall('failure'); } catch (error) { error.message; }"
+                )
+                .unwrap(),
+            super::JsValue::String("expected host callback failure".to_string())
+        );
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(
+                    realm,
+                    "try { hostCall('panic'); } catch (error) { error.message; }"
+                )
+                .unwrap(),
+            super::JsValue::String("host callback panicked".to_string())
+        );
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(
+                    realm,
+                    "try { hostCall('oversize'); } catch (error) { error.message; }"
+                )
+                .unwrap(),
+            super::JsValue::String("host callback response exceeds the 16 KiB limit".to_string())
+        );
+    }
+
+    #[test]
+    fn v8_realm_host_callback_function_cannot_be_transferred_to_another_realm() {
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let granted_realm = runtime.create_realm().expect("grant Realm is created");
+        let caller_realm = runtime.create_realm().expect("caller Realm is created");
+        runtime
+            .install_host_callback(granted_realm, |_| Ok("must not be called".to_string()))
+            .expect("host callback is granted only to the selected Realm");
+
+        assert_eq!(
+            runtime.host_callback_cross_realm_probe(granted_realm, caller_realm),
+            0,
+            "transferring the host function to another Realm must not transfer its capability"
+        );
+    }
+
+    #[test]
+    fn v8_realm_host_callback_rejects_reentrant_dispatch() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let realm = runtime.create_realm().expect("Realm is created");
+        let state_pointer = Rc::new(Cell::new(std::ptr::null_mut()));
+        let callback_state_pointer = Rc::clone(&state_pointer);
+        runtime
+            .install_host_callback(realm, move |input| {
+                if input == "outer" {
+                    let (status, message) = super::native::invoke_host_callback_dispatch_for_test(
+                        callback_state_pointer.get(),
+                        "inner",
+                    );
+                    Ok(format!("{status}:{message}"))
+                } else {
+                    Ok(input.to_string())
+                }
+            })
+            .expect("host callback is installed");
+        state_pointer.set(runtime.host_callback_state_pointer_for_test());
+
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(realm, "hostCall('outer')")
+                .unwrap(),
+            super::JsValue::String("-3:reentrant host callback rejected".to_string())
+        );
     }
 
     #[test]

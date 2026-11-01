@@ -1,6 +1,7 @@
 // FreeBSD V8 embedding boundary. V8 platform initialization is process-wide;
 // each AIBE runtime owns one isolate and one context on its creating thread.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
@@ -93,6 +94,9 @@ struct AibeNodeWrapperKeyHash {
     }
 };
 
+using AibeHostCallback = int (*)(
+    void*, const uint8_t*, size_t, uint8_t*, size_t, size_t*);
+
 struct AibeV8Runtime {
     std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
     v8::Isolate* isolate = nullptr;
@@ -101,6 +105,9 @@ struct AibeV8Runtime {
     std::unordered_map<uint64_t, v8::Global<v8::Context>> realms;
     uint64_t next_realm_id = 1;
     std::thread::id owner_thread;
+    AibeHostCallback host_callback = nullptr;
+    void* host_callback_data = nullptr;
+    uint64_t host_callback_realm_id = 0;
     v8::Global<v8::FunctionTemplate> node_template;
     // Weak per-runtime, per-Realm identity cache; it never roots JS wrappers.
     // Native identity is scoped by Realm: the same host node may have one
@@ -115,9 +122,8 @@ namespace {
 constexpr int kAibeRealmEmbedderDataIndex = 1;
 constexpr uint64_t kInvalidRealmId = UINT64_MAX;
 
-uint64_t current_realm_id(v8::Isolate* isolate)
+uint64_t realm_id_from_context(v8::Local<v8::Context> context)
 {
-    auto context = isolate->GetCurrentContext();
     if (context.IsEmpty()) {
         return kInvalidRealmId;
     }
@@ -128,6 +134,11 @@ uint64_t current_realm_id(v8::Isolate* isolate)
     bool lossless = false;
     const auto realm_id = data.As<v8::BigInt>()->Uint64Value(&lossless);
     return lossless ? realm_id : kInvalidRealmId;
+}
+
+uint64_t current_realm_id(v8::Isolate* isolate)
+{
+    return realm_id_from_context(isolate->GetCurrentContext());
 }
 
 std::atomic<size_t> g_finalized_dom_wrappers{0};
@@ -315,6 +326,68 @@ void node_remove_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     child->node->parent.reset();
     children.erase(found);
     info.GetReturnValue().Set(info[0]);
+}
+
+constexpr size_t kAibeHostCallbackMaxBytes = 16 * 1024;
+
+void host_bridge_callback(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* runtime = static_cast<AibeV8Runtime*>(isolate->GetData(0));
+    const auto current_context = isolate->GetCurrentContext();
+    const auto incumbent_context = isolate->GetIncumbentContext();
+    if (runtime == nullptr || runtime->host_callback == nullptr
+        || current_context.IsEmpty() || incumbent_context.IsEmpty()
+        || realm_id_from_context(current_context) != runtime->host_callback_realm_id
+        || realm_id_from_context(incumbent_context) != runtime->host_callback_realm_id) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "host callback capability is unavailable")));
+        return;
+    }
+    if (info.Length() != 1 || !info[0]->IsString()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "hostCall requires exactly one string argument")));
+        return;
+    }
+
+    v8::String::Utf8Value input(isolate, info[0]);
+    if (*input == nullptr || input.length() < 0) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "hostCall input is not valid UTF-8")));
+        return;
+    }
+    const size_t input_length = static_cast<size_t>(input.length());
+    if (input_length > kAibeHostCallbackMaxBytes) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(isolate, "hostCall input exceeds the 16 KiB limit")));
+        return;
+    }
+
+    std::array<uint8_t, kAibeHostCallbackMaxBytes> output{};
+    size_t output_length = 0;
+    const int status = runtime->host_callback(
+        runtime->host_callback_data,
+        reinterpret_cast<const uint8_t*>(*input), input_length,
+        output.data(), output.size(), &output_length);
+    if (output_length > output.size()) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "host callback returned an invalid length")));
+        return;
+    }
+
+    v8::Local<v8::String> result;
+    if (!v8::String::NewFromUtf8(
+            isolate, reinterpret_cast<const char*>(output.data()),
+            v8::NewStringType::kNormal, static_cast<int>(output_length)).ToLocal(&result)) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "host callback result could not be decoded")));
+        return;
+    }
+    if (status != 0) {
+        isolate->ThrowException(v8::Exception::Error(result));
+        return;
+    }
+    info.GetReturnValue().Set(result);
 }
 
 void node_add_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
@@ -1050,9 +1123,120 @@ extern "C" int aibe_v8_destroy_realm(void* opaque, uint64_t realm_id)
     if (found == runtime->realms.end()) {
         return -9;
     }
+    if (runtime->host_callback_realm_id == realm_id) {
+        runtime->host_callback = nullptr;
+        runtime->host_callback_data = nullptr;
+        runtime->host_callback_realm_id = 0;
+    }
     found->second.Reset();
     runtime->realms.erase(found);
     return 0;
+}
+
+extern "C" int aibe_v8_install_host_callback(
+    void* opaque, uint64_t realm_id, AibeHostCallback callback, void* user_data)
+{
+    if (opaque == nullptr || realm_id == 0 || callback == nullptr || user_data == nullptr) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    if (runtime->host_callback != nullptr) {
+        return -11;
+    }
+    auto found = runtime->realms.find(realm_id);
+    if (found == runtime->realms.end()) {
+        return -9;
+    }
+
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+    auto context = found->second.Get(runtime->isolate);
+    if (context.IsEmpty()) {
+        return -8;
+    }
+    v8::Context::Scope context_scope(context);
+    auto function = v8::Function::New(context, host_bridge_callback);
+    v8::Local<v8::Function> host_function;
+    if (!function.ToLocal(&host_function)
+        || !context->Global()
+                ->DefineOwnProperty(
+                    context, v8::String::NewFromUtf8Literal(runtime->isolate, "hostCall"),
+                    host_function, v8::None)
+                .FromMaybe(false)) {
+        return -8;
+    }
+
+    runtime->host_callback = callback;
+    runtime->host_callback_data = user_data;
+    runtime->host_callback_realm_id = realm_id;
+    return 0;
+}
+
+// Test-only probe: transfer a granted host function into another Realm and
+// verify that the callback checks the caller's active Realm, not just origin.
+extern "C" int aibe_v8_host_callback_cross_realm_probe(
+    void* opaque, uint64_t grant_realm_id, uint64_t caller_realm_id)
+{
+    if (opaque == nullptr || grant_realm_id == 0 || caller_realm_id == 0
+        || grant_realm_id == caller_realm_id) {
+        return -1;
+    }
+    auto* runtime = static_cast<AibeV8Runtime*>(opaque);
+    if (std::this_thread::get_id() != runtime->owner_thread) {
+        return -7;
+    }
+    auto grant = runtime->realms.find(grant_realm_id);
+    auto caller = runtime->realms.find(caller_realm_id);
+    if (grant == runtime->realms.end() || caller == runtime->realms.end()) {
+        return -9;
+    }
+
+    v8::Isolate::Scope isolate_scope(runtime->isolate);
+    v8::HandleScope handle_scope(runtime->isolate);
+    v8::Local<v8::Function> host_function;
+    {
+        auto context = grant->second.Get(runtime->isolate);
+        v8::Context::Scope context_scope(context);
+        v8::Local<v8::Value> value;
+        if (!context->Global()
+                 ->Get(context, v8::String::NewFromUtf8Literal(runtime->isolate, "hostCall"))
+                 .ToLocal(&value)
+            || !value->IsFunction()) {
+            return -8;
+        }
+        host_function = value.As<v8::Function>();
+    }
+    {
+        auto context = caller->second.Get(runtime->isolate);
+        v8::Context::Scope context_scope(context);
+        if (!context->Global()
+                 ->DefineOwnProperty(
+                     context, v8::String::NewFromUtf8Literal(runtime->isolate, "hostCall"),
+                     host_function, v8::None)
+                 .FromMaybe(false)) {
+            return -10;
+        }
+        auto source = v8::String::NewFromUtf8Literal(
+            runtime->isolate,
+            "try { hostCall('probe'); } catch (error) { error.message; }");
+        v8::Local<v8::Script> script;
+        if (!v8::Script::Compile(context, source).ToLocal(&script)) {
+            return -11;
+        }
+        v8::Local<v8::Value> result;
+        if (!script->Run(context).ToLocal(&result) || !result->IsString()) {
+            return -12;
+        }
+        v8::String::Utf8Value message(runtime->isolate, result);
+        if (*message == nullptr) {
+            return -13;
+        }
+        const std::string actual(*message, static_cast<size_t>(message.length()));
+        return actual == "host callback capability is unavailable" ? 0 : -14;
+    }
 }
 
 // Test-only probe: one native Node identity must map to distinct wrappers
