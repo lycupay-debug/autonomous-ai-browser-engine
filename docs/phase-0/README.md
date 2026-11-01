@@ -367,3 +367,36 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - GitHub Actions Run [41282807723](https://github.com/lycupay-debug/autonomous-ai-browser-engine/actions/runs/41282807723) is still running; Rust and supply-chain final conclusions are pending.
 - Remaining: process identity stronger than UID/GID, production Broker capability grants and revocation, per-peer quotas, rctl (host `kern.racct.enable=0`), multi-renderer scheduling, production storage semantics, network broker enforcement and hostile IPC stress.
 - This is a feasibility PoC, not a production Renderer Sandbox. No persistent host configuration or production service was changed.
+
+## Versioned per-renderer Origin storage grant envelope — 2026-11-01
+
+### Design and implementation
+
+- Replaced the one-byte storage marker with a fixed-size 32-byte local grant envelope: magic, protocol version, descriptor count, broker-tracked Renderer PID, rights mask, grant ID, and host-issued Origin Group ID.
+- Changed this PoC's Broker/Renderer channel from `SOCK_STREAM` to `SOCK_SEQPACKET`, so the grant header and its `SCM_RIGHTS` ancillary descriptor are received as one bounded record rather than relying on stream read boundaries.
+- Broker still obtains kernel-reported peer effective UID/GID with `getpeereid()` and requires exact equality with the local policy before sending the descriptor.
+- Renderer validates protocol version, magic, exactly-one-descriptor declaration, expected child PID, read-only grant mask, grant ID, and expected Origin Group before accepting the descriptor. It then applies `CAP_LOOKUP | CAP_READ | CAP_FSTAT` and enters Capsicum capability mode.
+- Negative tests send multiple descriptors, a validly shaped grant for the wrong Origin Group, and a grant addressed to a different Renderer PID. All rejected received descriptors are checked for closure.
+- The PID value is bound to the broker-created `socketpair()` and `fork()` relationship, which the Broker tracks locally. It is not a kernel-reported peer PID and must not be treated as a standalone authentication factor. `getpeereid()` in this experiment authenticates effective UID/GID only.
+
+### Verification
+
+- FreeBSD 15.1: `clang -Wall -Wextra -Werror -O2` compile passed.
+- Grant-envelope and per-Origin storage PoC: all five positive/negative checks passed.
+- The complete focused PoC passed 20/20 independent executions.
+- `clang --analyze -Wall -Wextra -O2` passed; generated plist was removed.
+- `git diff --check` passed.
+
+### Limits and next gates
+
+- This is still a single-renderer, local feasibility PoC. Grant IDs are test constants, not a durable or cryptographically random capability registry.
+- No production grant issuance/revocation registry, expiry, replay protection, renderer quotas, multi-renderer scheduling, privilege-separated service accounts, or persistent storage backend exists.
+- The receiver validates a broker-issued envelope on a broker-created private channel; this does not replace kernel peer credential checks or establish a production cross-process authorization protocol.
+- Continue with explicit grant lifecycle/state transitions, duplicate/replay rejection, bounded peer quotas, and hostile malformed/truncated packet tests before considering any production Broker contract.
+
+## FreeBSD V8 SDK prefix default correction — 2026-11-01
+
+- A clean Cargo invocation without `AIBE_RUNTIME_PREFIX` exposed a mismatch: the FFI `build.rs` defaulted to `/usr/local`, while the project's documented extracted, non-installed runtime SDK and helper scripts use `/tmp/aibe-runtime-root/usr/local`.
+- Updated the build-script fallback to the documented isolated prefix. No packages were installed and no host include/library paths were modified.
+- Verified the full workspace with `AIBE_RUNTIME_PREFIX` explicitly unset and `LD_LIBRARY_PATH` pointing at the extracted SDK: 88/88 tests passed. Formatting and Clippy with `-D warnings` passed.
+- This fixes the default build path for the existing Phase 0 extracted SDK layout; it does not make the external V8/SpiderMonkey SDK part of the repository or remove the documented runtime-library environment requirement.

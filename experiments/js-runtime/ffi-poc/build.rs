@@ -10,8 +10,10 @@ fn main() {
         return;
     }
 
-    let prefix =
-        PathBuf::from(env::var("AIBE_RUNTIME_PREFIX").unwrap_or_else(|_| "/usr/local".into()));
+    let prefix = PathBuf::from(
+        env::var("AIBE_RUNTIME_PREFIX")
+            .unwrap_or_else(|_| "/tmp/aibe-runtime-root/usr/local".into()),
+    );
     let include = prefix.join("include");
     let library = prefix.join("lib");
 

@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,38 @@
 
 #define RENDERER_IPC_FD 3
 #define ORIGIN_STORAGE_FD 4
+#define GRANT_MAGIC UINT32_C(0x41494245)
+#define GRANT_PROTOCOL_VERSION UINT16_C(1)
+#define ORIGIN_GROUP_A UINT64_C(0xA1)
+#define ORIGIN_GROUP_B UINT64_C(0xB1)
+#define STORAGE_GRANT_ID UINT64_C(0x1001)
+#define STORAGE_RIGHT_READ UINT32_C(0x01)
+
+/* Local Broker/Renderer ABI; SOCK_SEQPACKET preserves this envelope as one record. */
+struct storage_grant_header {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t descriptor_count;
+    uint32_t renderer_pid;
+    uint32_t rights;
+    uint64_t grant_id;
+    uint64_t origin_group_id;
+};
+
+_Static_assert(sizeof(struct storage_grant_header) == 32, "storage grant header ABI size changed");
+
+static struct storage_grant_header make_storage_grant(pid_t renderer_pid, uint64_t origin_group_id)
+{
+    return (struct storage_grant_header) {
+        .magic = GRANT_MAGIC,
+        .version = GRANT_PROTOCOL_VERSION,
+        .descriptor_count = 1,
+        .renderer_pid = (uint32_t)renderer_pid,
+        .rights = STORAGE_RIGHT_READ,
+        .grant_id = STORAGE_GRANT_ID,
+        .origin_group_id = origin_group_id,
+    };
+}
 
 static int write_secret(const char *path, const char *value)
 {
@@ -65,10 +98,12 @@ static int authorize_renderer_peer(int ipc_fd)
     return 0;
 }
 
-static int send_origin_storage_fd(int ipc_fd, int storage_fd)
+static int send_origin_storage_fd(
+    int ipc_fd,
+    int storage_fd,
+    const struct storage_grant_header *grant)
 {
-    char marker = 'A';
-    struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
+    struct iovec iov = { .iov_base = (void *)grant, .iov_len = sizeof(*grant) };
     char control[CMSG_SPACE(sizeof(int))];
     memset(control, 0, sizeof(control));
 
@@ -90,7 +125,7 @@ static int send_origin_storage_fd(int ipc_fd, int storage_fd)
     memcpy(CMSG_DATA(header), &storage_fd, sizeof(storage_fd));
 
     ssize_t sent = sendmsg(ipc_fd, &message, 0);
-    if (sent != (ssize_t)sizeof(marker)) {
+    if (sent != (ssize_t)sizeof(*grant)) {
         if (sent >= 0) errno = EIO;
         return -1;
     }
@@ -115,10 +150,15 @@ static void close_received_rights(struct msghdr *message)
     }
 }
 
-static int receive_origin_storage_fd(int ipc_fd)
+static int receive_origin_storage_fd(
+    int ipc_fd,
+    pid_t expected_renderer_pid,
+    uint64_t expected_origin_group_id,
+    uint64_t expected_grant_id)
 {
-    char marker = 0;
-    struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
+    struct storage_grant_header grant;
+    memset(&grant, 0, sizeof(grant));
+    struct iovec iov = { .iov_base = &grant, .iov_len = sizeof(grant) };
     char control[CMSG_SPACE(sizeof(int) * 4)];
     memset(control, 0, sizeof(control));
     struct msghdr message;
@@ -128,8 +168,15 @@ static int receive_origin_storage_fd(int ipc_fd)
     message.msg_control = control;
     message.msg_controllen = sizeof(control);
     ssize_t received = recvmsg(ipc_fd, &message, 0);
-    if (received != (ssize_t)sizeof(marker) || marker != 'A' ||
-        (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+    if (received != (ssize_t)sizeof(grant) ||
+        (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0 ||
+        grant.magic != GRANT_MAGIC ||
+        grant.version != GRANT_PROTOCOL_VERSION ||
+        grant.descriptor_count != 1 ||
+        grant.renderer_pid != (uint32_t)expected_renderer_pid ||
+        grant.rights != STORAGE_RIGHT_READ ||
+        grant.grant_id != expected_grant_id ||
+        grant.origin_group_id != expected_origin_group_id) {
         close_received_rights(&message);
         errno = EPROTO;
         return -1;
@@ -163,7 +210,7 @@ static int test_rejects_multiple_storage_fds(void)
 {
     int channels[2] = {-1, -1};
     int sources[2] = {STDIN_FILENO, STDOUT_FILENO};
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) return -1;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, channels) != 0) return -1;
     pid_t child = fork();
     if (child < 0) { (void)close(channels[0]); (void)close(channels[1]); return -1; }
     if (child == 0) {
@@ -171,7 +218,8 @@ static int test_rejects_multiple_storage_fds(void)
         if (dup2(channels[1], RENDERER_IPC_FD) < 0) _exit(EXIT_FAILURE);
         if (channels[1] != RENDERER_IPC_FD) (void)close(channels[1]);
         closefrom(RENDERER_IPC_FD + 1);
-        int result = receive_origin_storage_fd(RENDERER_IPC_FD);
+        int result = receive_origin_storage_fd(
+            RENDERER_IPC_FD, getpid(), ORIGIN_GROUP_A, STORAGE_GRANT_ID);
         if (result >= 0) { (void)close(result); _exit(EXIT_FAILURE); }
         errno = 0;
         if (fcntl(ORIGIN_STORAGE_FD, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
@@ -180,8 +228,8 @@ static int test_rejects_multiple_storage_fds(void)
         _exit(EXIT_SUCCESS);
     }
     (void)close(channels[1]);
-    char marker = 'A';
-    struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
+    struct storage_grant_header grant = make_storage_grant(child, ORIGIN_GROUP_A);
+    struct iovec iov = { .iov_base = &grant, .iov_len = sizeof(grant) };
     char control[CMSG_SPACE(sizeof(sources))];
     memset(control, 0, sizeof(control));
     struct msghdr message;
@@ -199,18 +247,21 @@ static int test_rejects_multiple_storage_fds(void)
     ssize_t sent = sendmsg(channels[0], &message, 0);
     (void)close(channels[0]);
     int status = 0;
-    if (waitpid(child, &status, 0) < 0 || sent != (ssize_t)sizeof(marker) ||
+    if (waitpid(child, &status, 0) < 0 || sent != (ssize_t)sizeof(grant) ||
         !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) return -1;
     (void)puts("PASS: malformed multi-FD SCM_RIGHTS message rejected; all received descriptors closed");
     (void)fflush(stdout);
     return 0;
 }
 
-static int test_rejects_wrong_marker_and_closes_fd(void)
+static int test_rejects_invalid_grant_and_closes_fd(
+    uint64_t supplied_origin_group_id,
+    pid_t renderer_pid_delta,
+    const char *case_name)
 {
     int channels[2] = {-1, -1};
     int source_fd = STDIN_FILENO;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) return -1;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, channels) != 0) return -1;
     pid_t child = fork();
     if (child < 0) { (void)close(channels[0]); (void)close(channels[1]); return -1; }
     if (child == 0) {
@@ -218,15 +269,17 @@ static int test_rejects_wrong_marker_and_closes_fd(void)
         if (dup2(channels[1], RENDERER_IPC_FD) < 0) _exit(EXIT_FAILURE);
         if (channels[1] != RENDERER_IPC_FD) (void)close(channels[1]);
         closefrom(RENDERER_IPC_FD + 1);
-        int result = receive_origin_storage_fd(RENDERER_IPC_FD);
+        int result = receive_origin_storage_fd(
+            RENDERER_IPC_FD, getpid(), ORIGIN_GROUP_A, STORAGE_GRANT_ID);
         if (result >= 0) { (void)close(result); _exit(EXIT_FAILURE); }
         errno = 0;
         if (fcntl(ORIGIN_STORAGE_FD, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
         _exit(EXIT_SUCCESS);
     }
     (void)close(channels[1]);
-    char marker = 'X';
-    struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
+    struct storage_grant_header grant = make_storage_grant(
+        child + renderer_pid_delta, supplied_origin_group_id);
+    struct iovec iov = { .iov_base = &grant, .iov_len = sizeof(grant) };
     char control[CMSG_SPACE(sizeof(source_fd))];
     memset(control, 0, sizeof(control));
     struct msghdr message;
@@ -244,9 +297,9 @@ static int test_rejects_wrong_marker_and_closes_fd(void)
     ssize_t sent = sendmsg(channels[0], &message, 0);
     (void)close(channels[0]);
     int status = 0;
-    if (waitpid(child, &status, 0) < 0 || sent != (ssize_t)sizeof(marker) ||
+    if (waitpid(child, &status, 0) < 0 || sent != (ssize_t)sizeof(grant) ||
         !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) return -1;
-    (void)puts("PASS: invalid SCM_RIGHTS marker rejected; received descriptor closed");
+    (void)printf("PASS: invalid %s storage grant rejected; received descriptor closed\n", case_name);
     (void)fflush(stdout);
     return 0;
 }
@@ -269,7 +322,8 @@ static int renderer_read_origin_a(int inherited_ipc_fd, int inherited_origin_a_f
     }
     if (limit_standard_descriptors() != 0) return EXIT_FAILURE;
 
-    int storage_fd = receive_origin_storage_fd(RENDERER_IPC_FD);
+    int storage_fd = receive_origin_storage_fd(
+        RENDERER_IPC_FD, getpid(), ORIGIN_GROUP_A, STORAGE_GRANT_ID);
     if (storage_fd < 0) {
         perror("renderer receive Origin A storage FD");
         return EXIT_FAILURE;
@@ -334,7 +388,7 @@ static int renderer_read_origin_a(int inherited_ipc_fd, int inherited_origin_a_f
         perror("renderer ready IPC");
         return EXIT_FAILURE;
     }
-    (void)puts("PASS: renderer received only Origin A via SCM_RIGHTS; Origin B traversal and writes denied");
+    (void)puts("PASS: versioned grant bound to renderer PID and Origin A; cross-origin traversal and writes denied");
     (void)fflush(stdout);
     (void)close(storage_fd);
     (void)close(RENDERER_IPC_FD);
@@ -365,8 +419,12 @@ int main(void)
         (void)fprintf(stderr, "FAIL: malformed SCM_RIGHTS descriptor cleanup test\n");
         goto cleanup;
     }
-    if (test_rejects_wrong_marker_and_closes_fd() != 0) {
-        (void)fprintf(stderr, "FAIL: invalid SCM_RIGHTS marker cleanup test\n");
+    if (test_rejects_invalid_grant_and_closes_fd(ORIGIN_GROUP_B, 0, "origin") != 0) {
+        (void)fprintf(stderr, "FAIL: wrong-origin storage grant cleanup test\n");
+        goto cleanup;
+    }
+    if (test_rejects_invalid_grant_and_closes_fd(ORIGIN_GROUP_A, 1, "renderer PID") != 0) {
+        (void)fprintf(stderr, "FAIL: wrong-renderer-PID storage grant cleanup test\n");
         goto cleanup;
     }
     (void)snprintf(origin_a, sizeof(origin_a), "%s/origin-a", root);
@@ -386,7 +444,7 @@ int main(void)
         perror("open origin storage directories");
         goto cleanup;
     }
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) {
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, channels) != 0) {
         perror("create broker/renderer IPC socketpair");
         goto cleanup;
     }
@@ -407,7 +465,8 @@ int main(void)
         perror("authorize renderer peer before storage grant");
         goto cleanup;
     }
-    if (send_origin_storage_fd(channels[0], origin_a_fd) != 0) {
+    struct storage_grant_header grant = make_storage_grant(child, ORIGIN_GROUP_A);
+    if (send_origin_storage_fd(channels[0], origin_a_fd, &grant) != 0) {
         perror("broker send Origin A storage FD");
         goto cleanup;
     }
@@ -434,7 +493,7 @@ int main(void)
         goto cleanup;
     }
 
-    (void)puts("PASS: broker transferred only the authorized per-origin storage FD");
+    (void)puts("PASS: broker authenticated peer UID/GID and transferred one PID/Origin-scoped storage capability");
     result = EXIT_SUCCESS;
 
 cleanup:
