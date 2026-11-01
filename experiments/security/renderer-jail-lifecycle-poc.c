@@ -105,6 +105,32 @@ renderer_child(const char *socket_path, const char *host_marker)
         munmap(memory, MEMORY_PROBE_BYTES);
     }
     (void)write_all(fd, result, strlen(result));
+
+    if (read_all(fd, &command, 1) != 0 || command != 'P')
+        return 16;
+    pid_t first_child = fork();
+    if (first_child < 0) {
+        result = "PROC_FIRST_FORK_ERROR\n";
+    } else if (first_child == 0) {
+        for (;;)
+            pause();
+    } else {
+        pid_t second_child = fork();
+        if (second_child < 0 && errno == EAGAIN) {
+            result = "PROC_DENIED\n";
+        } else {
+            result = "PROC_ALLOWED\n";
+            if (second_child == 0)
+                _exit(0);
+            if (second_child > 0)
+                (void)kill(second_child, SIGKILL);
+            (void)waitpid(second_child, NULL, 0);
+        }
+        (void)kill(first_child, SIGKILL);
+        (void)waitpid(first_child, NULL, 0);
+    }
+    (void)write_all(fd, result, strlen(result));
+
     /* Keep the Renderer alive so the host can verify forced Jail teardown. */
     char shutdown_command;
     (void)read_all(fd, &shutdown_command, 1);
@@ -321,10 +347,15 @@ renderer_host(const char *self)
     (void)snprintf(rule, sizeof(rule), "jail:%s:vmemoryuse:deny=128M/jail", jail_name);
     char *rctl_argv[] = {"/usr/bin/rctl", "-a", rule, NULL};
     if (run_command(rctl_argv) != 0) {
-        fprintf(stderr, "FAIL: unable to apply jail-scoped RCTL rule\n");
+        fprintf(stderr, "FAIL: unable to apply jail-scoped vmemoryuse rule\n");
         goto cleanup;
     }
     rule_created = 1;
+    (void)snprintf(rule, sizeof(rule), "jail:%s:maxproc:deny=2/jail", jail_name);
+    if (run_command(rctl_argv) != 0) {
+        fprintf(stderr, "FAIL: unable to apply jail-scoped maxproc rule\n");
+        goto cleanup;
+    }
     (void)snprintf(rule, sizeof(rule), "jail:%s", jail_name);
     char *usage_argv[] = {"/usr/bin/rctl", "-hu", rule, NULL};
     printf("=== live jail resource snapshot ===\n");
@@ -336,6 +367,12 @@ renderer_host(const char *self)
         goto cleanup;
     }
     printf("PASS: jail-scoped vmemoryuse limit denied 256 MiB mapping (%s)", line);
+    if (write_all(connection, "P", 1) != 0 || read_line(connection, line, sizeof(line)) != 0 ||
+        strcmp(line, "PROC_DENIED\n") != 0) {
+        fprintf(stderr, "FAIL: jail maxproc rule did not deny the second fork: %s\n", line);
+        goto cleanup;
+    }
+    printf("PASS: jail-scoped maxproc limit denied the second fork (%s)", line);
     result = 0;
 
 cleanup:

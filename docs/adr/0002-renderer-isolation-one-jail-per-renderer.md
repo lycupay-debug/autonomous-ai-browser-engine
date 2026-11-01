@@ -41,11 +41,11 @@ The initial Jail boundary must:
 - The Supervisor must track both the `jail(8)` launcher and the actual Renderer PID/JID; they are not the same PID.
 - Jail creation, rootfs preparation, mount lifecycle, IPC and teardown add latency and operational complexity.
 - Jails share the host kernel; they are not virtual machines and do not eliminate kernel attack-surface risk.
-- Per-Jail RCTL limits must be based on measured Renderer workloads; the current PoC limit is only a negative-test threshold.
+- Per-Jail RCTL limits must be based on measured Renderer workloads; the current PoC limits are only negative-test thresholds.
 
 ## Validation status
 
-- Verified on FreeBSD 15.1-RELEASE-p6: one low-privilege process connects through a UDS located inside a dedicated temporary rootfs; `LOCAL_PEERCRED` reports PID/UID/GID; `KERN_PROC_PID` reports the same PID and the expected nonzero Jail ID; the listener is `FD_CLOEXEC` and the child verifies that no unexpected descriptors were inherited; a host-only marker is not visible; a Jail-scoped `vmemoryuse` rule denies a 256 MiB mapping at a 128 MiB limit; destroying the Jail terminates the Renderer process.
+- Verified on FreeBSD 15.1-RELEASE-p6: one low-privilege process connects through a UDS located inside a dedicated temporary rootfs; `LOCAL_PEERCRED` reports PID/UID/GID; `KERN_PROC_PID` reports the same PID and the expected nonzero Jail ID; the listener is `FD_CLOEXEC` and the child verifies that no unexpected descriptors were inherited; a host-only marker is not visible; Jail-scoped `vmemoryuse` and `maxproc` rules deny a 256 MiB mapping at a 128 MiB limit and a second fork at a two-process limit; destroying the Jail terminates the Renderer process.
 - Repeated and concurrent execution evidence is recorded in `docs/phase-0/README.md`.
 - This is an isolated C lifecycle PoC, not yet integration into the Rust `RendererSupervisor`, not the production V8 Renderer runtime rootfs, and not the complete Renderer Sandbox.
 
