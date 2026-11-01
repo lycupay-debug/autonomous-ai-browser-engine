@@ -84,6 +84,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aibe-renderer-supervisor-poc"
+version = "0.1.0"
+dependencies = [
+ "aibe-broker-policy-poc",
+ "aibe-control-protocol-uds-poc",
+]
+
+[[package]]
 name = "aibe-snapshot-bridge-poc"
 version = "0.1.0"
 dependencies = [
@@ -91,6 +99,7 @@ dependencies = [
  "aibe-browser-runtime-origin-poc",
  "aibe-control-protocol-uds-poc",
  "aibe-origin-policy-poc",
+ "aibe-renderer-supervisor-poc",
  "serde_json",
 ]
 

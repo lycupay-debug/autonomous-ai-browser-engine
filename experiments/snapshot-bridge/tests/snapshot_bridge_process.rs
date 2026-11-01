@@ -1,16 +1,13 @@
 #![cfg(target_os = "freebsd")]
 
-use std::io;
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use aibe_broker_policy_poc::{RendererId, RendererPrincipal, SnapshotGrantRegistry};
+use aibe_broker_policy_poc::{GrantRegistry, OriginGroupId, SnapshotGrantRegistry, StorageRights};
 use aibe_browser_runtime_origin_poc::OriginRealmRuntime;
 use aibe_browser_runtime_origin_poc::navigation::{FrameId, NavigationController};
-use aibe_control_protocol_uds_poc::bind_private_socket;
+use aibe_renderer_supervisor_poc::RendererSupervisor;
 use aibe_snapshot_bridge_poc::send_current_document_snapshot;
 use std::collections::HashMap;
 use std::fmt;
@@ -55,69 +52,14 @@ impl OriginRealmRuntime for MockRuntime {
     }
 }
 
-unsafe extern "C" {
-    fn geteuid() -> u32;
-    fn getegid() -> u32;
-}
-
-fn socket_path() -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "aibe-full-snapshot-bridge-{}-{nonce}.sock",
-        std::process::id()
-    ))
-}
-
-fn accept_with_deadline(
-    listener: &UnixListener,
-    child: &mut Child,
-) -> io::Result<std::os::unix::net::UnixStream> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => return Ok(stream),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(status) = child.try_wait()? {
-                    return Err(io::Error::other(format!(
-                        "Renderer exited before connect: {status}"
-                    )));
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Renderer UDS connect timed out",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 #[test]
-fn browser_runtime_document_to_broker_grant_to_independent_renderer_process() {
-    let path = socket_path();
-    let listener = bind_private_socket(&path).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let mut child = Command::new(
-        std::env::var("CARGO_BIN_EXE_snapshot-bridge-renderer").expect("Cargo binary path"),
-    )
-    .arg(&path)
-    .spawn()
-    .unwrap();
-    let renderer = RendererPrincipal::new(
-        RendererId::new(0xB002).unwrap(),
-        child.id(),
-        unsafe { geteuid() },
-        unsafe { getegid() },
-    )
-    .unwrap();
-    let mut stream = accept_with_deadline(&listener, &mut child).unwrap();
+fn supervisor_binds_renderer_pid_and_releases_grants_after_exit_and_restart() {
+    let mut supervisor = RendererSupervisor::new(std::env::temp_dir());
+    let renderer_binary = env!("CARGO_BIN_EXE_snapshot-bridge-renderer");
+    let principal = supervisor
+        .spawn(Command::new(renderer_binary), Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(supervisor.principal(principal.id()), Some(principal));
 
     let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
     let frame: FrameId = controller
@@ -127,25 +69,92 @@ fn browser_runtime_document_to_broker_grant_to_independent_renderer_process() {
     controller
         .parse_document_html(
             document,
-            b"<!doctype html><html><body><p>full snapshot bridge</p></body></html>",
+            b"<!doctype html><html><body><p>supervised snapshot bridge</p></body></html>",
         )
         .unwrap();
+    let snapshot = controller.current_document_snapshot(frame).unwrap();
 
+    let mut storage_grants = GrantRegistry::new(8, 2).unwrap();
     let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
+    storage_grants
+        .issue(
+            principal,
+            OriginGroupId::new(0x7711).unwrap(),
+            StorageRights::READ_ONLY,
+        )
+        .unwrap();
+    let stream = supervisor.stream_mut(principal).unwrap();
     let receipt =
-        send_current_document_snapshot(&controller, frame, &mut stream, renderer, 71, &mut grants)
+        send_current_document_snapshot(&controller, frame, stream, principal, 71, &mut grants)
             .unwrap();
-    assert_eq!(receipt.peer.pid, child.id());
-    assert_eq!(receipt.document_id, document.value());
-    assert_eq!(receipt.revision, 1);
+    assert_eq!(receipt.peer.pid, principal.pid());
+    assert_eq!(receipt.document_id, snapshot.document_id());
+    assert_eq!(receipt.revision, snapshot.revision());
     assert_eq!(grants.active_count(), 1);
 
-    drop(stream);
-    drop(listener);
-    let status = child.wait().unwrap();
-    std::fs::remove_file(path).unwrap();
-    assert!(
-        status.success(),
-        "Renderer rejected Browser Runtime snapshot: {status}"
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first_exit = loop {
+        let exits = supervisor
+            .poll_exits(&mut storage_grants, &mut grants)
+            .unwrap();
+        if let Some(exit) = exits.into_iter().next() {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not observe Renderer exit"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(first_exit.status.success());
+    assert_eq!(first_exit.principal, principal);
+    assert_eq!(first_exit.released_storage_grants, 1);
+    assert_eq!(first_exit.released_snapshot_grants, 1);
+    assert_eq!(storage_grants.active_total_count(), 0);
+    assert_eq!(grants.active_count(), 0);
+    assert!(supervisor.is_empty());
+
+    // Restart creates a fresh Broker-issued Renderer instance even if the OS
+    // later reuses the old PID. Grants are bound to the complete principal.
+    let replacement = supervisor
+        .spawn(Command::new(renderer_binary), Duration::from_secs(5))
+        .unwrap();
+    assert_ne!(replacement.id(), principal.id());
+    assert_eq!(
+        replacement.pid(),
+        supervisor.principal(replacement.id()).unwrap().pid()
+    );
+    storage_grants
+        .issue(
+            replacement,
+            OriginGroupId::new(0x7712).unwrap(),
+            StorageRights::READ_ONLY,
+        )
+        .unwrap();
+    let replacement_grant = grants
+        .issue(
+            replacement,
+            snapshot.origin(),
+            snapshot.document_id(),
+            snapshot.revision(),
+        )
+        .unwrap();
+    let replacement_exit = supervisor
+        .terminate(replacement.id(), &mut storage_grants, &mut grants)
+        .unwrap();
+    assert_eq!(replacement_exit.principal, replacement);
+    assert_eq!(replacement_exit.released_storage_grants, 1);
+    assert_eq!(replacement_exit.released_snapshot_grants, 1);
+    assert_eq!(storage_grants.active_total_count(), 0);
+    assert_eq!(grants.active_count(), 0);
+    assert_eq!(
+        grants.authorize(
+            replacement_grant,
+            replacement,
+            snapshot.origin(),
+            snapshot.document_id(),
+            snapshot.revision(),
+        ),
+        Err(aibe_broker_policy_poc::SnapshotGrantError::UnknownGrant)
     );
 }

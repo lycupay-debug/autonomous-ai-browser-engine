@@ -11,3 +11,4 @@ aibe-control-protocol-uds-poc = { path = "../control-protocol/uds-poc" }
 
 serde_json = "=1.0.154"
 aibe-origin-policy-poc = { path = "../origin-policy" }
+aibe-renderer-supervisor-poc = { path = "../renderer-supervisor" }
