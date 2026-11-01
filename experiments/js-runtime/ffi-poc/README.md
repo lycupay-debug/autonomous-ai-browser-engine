@@ -11,7 +11,7 @@ AIBE_V8_EXECUTABLE=/tmp/aibe-runtime-root/usr/local/bin/d8 \
 cargo test -p aibe-js-runtime-ffi-poc --locked
 ```
 
-The V8 adapter keeps V8 types inside C++, exposes a narrow C ABI, and lets Rust own the runtime handle through RAII. The V8 platform is initialized once per process; each isolate/context belongs to its creating thread. Rust's wrapper is deliberately `!Send + !Sync`, and C ABI calls reject wrong-thread access. The returned string ABI includes an explicit byte length, preserving embedded NUL bytes.
+The V8 adapter keeps V8 types inside C++, exposes a narrow C ABI, and lets Rust own the runtime handle through RAII. The V8 platform is initialized once per process; each isolate/context belongs to its creating thread. Rust's wrapper is deliberately `!Send + !Sync`, and C ABI calls reject wrong-thread access. A first project-owned `JsRuntime` trait now hides the concrete V8 type and exposes stringified evaluation, explicit microtask checkpoints, and GC for the Phase 0 PoC. It is not the final contract: typed values, explicit realm/context handles, callbacks, host objects and scheduler integration remain open. The returned string ABI includes an explicit byte length, preserving embedded NUL bytes.
 
 Current tests cover isolate creation/destruction, simultaneous isolated globals, syntax/runtime errors, explicit Promise microtask checkpoints, a native `Node` wrapper with append/childCount, moving nodes between parents, rejecting ancestor cycles, self-referential JS objects, native parent/child ownership, and V8 GC weak finalization. SpiderMonkey's narrow C ABI test remains for fallback comparison.
 

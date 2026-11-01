@@ -81,6 +81,7 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - Decision rationale, constraints, reversal conditions and integration obligations are recorded in `docs/adr/0001-javascript-runtime-v8.md`.
 - V8 process-wide platform initialization now runs once. Multiple isolate/context instances have independent global state and lifetimes. The Rust wrapper is thread-affine (`!Send + !Sync`) and the C ABI rejects wrong-thread operations.
 - V8 microtasks use an explicit host checkpoint; this is not the WHATWG HTML Event Loop.
+- A minimal project-owned `JsRuntime` trait now hides the concrete V8 runtime and exposes stringified evaluation, microtask checkpoints, and GC; trait-object dispatch is tested. This is not the final production contract because typed values, context/realm handles, callbacks, host objects, and scheduler integration are still missing.
 - A V8 native `Node` wrapper PoC now validates append/childCount, moving a child between parents, rejecting ancestor cycles (preventing native shared-pointer graph leaks), JS self-reference, native parent/child ownership, and GC weak finalization. Wrapper identity/cache, listeners, navigation teardown and Worker lifetimes remain open.
 
 ## Network pinned TLS and redirect evidence — 2026-11-01
@@ -118,7 +119,7 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 
 ## Current verification snapshot — 2026-11-01
 
-- FreeBSD `cargo test --workspace --locked -- --test-threads=1`: 44 passed, 0 failed (Boa 7, UDS 9, Headless 3, V8 FFI 8, Network 17).
+- FreeBSD `cargo test --workspace --locked -- --test-threads=1`: 45 passed, 0 failed (Boa 7, UDS 9, Headless 3, V8 FFI 9, Network 17).
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed.
 - Native V8 and SpiderMonkey embed builds: both executed `1 + 2` and returned `3`.
@@ -137,3 +138,12 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - The FreeBSD UDS test server now uses this authenticated accept helper instead of performing credential checks inline.
 - Added a negative test that connects a local client while the server expects a different UID; the accept path returns `PermissionDenied`.
 - UDS test count is now 9/9 on FreeBSD. The protocol/state-machine server remains test-only; it is not yet the production Browser Broker.
+
+
+## Project-owned JavaScript Runtime contract — 2026-11-01
+
+- Added a Rust `JsRuntime` trait with no `Send`/`Sync` requirement, preserving V8 isolate thread affinity.
+- V8 implements `evaluate_to_string`, `microtask_checkpoint`, and `collect_garbage` without exposing V8 C++ or V8 Rust types.
+- A trait-object dispatch test confirms the selected runtime is usable through the project-owned interface.
+- This is a Phase 0 contract proof, not a production API freeze. Typed JS values, explicit context/realm handles, native callbacks, host objects, structured errors, and browser scheduler integration remain required.
+- V8 FFI test count is now 9/9; total FreeBSD workspace tests are 45/45.

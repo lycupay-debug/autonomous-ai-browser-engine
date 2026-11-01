@@ -3,6 +3,37 @@
 //! V8 is the selected runtime. SpiderMonkey remains available only as a
 //! comparison/fallback PoC until a future ADR changes that decision.
 
+/// Project-owned JavaScript Runtime boundary. Implementations must not expose
+/// engine-specific handles or types. The initial Phase 0 contract deliberately
+/// supports stringified evaluation and explicit host checkpoints only; typed
+/// values, callbacks, realms, and browser-agent scheduling are later work.
+///
+/// No `Send` or `Sync` bound is imposed: the selected V8 isolate is thread-affine.
+pub trait JsRuntime {
+    fn evaluate_to_string(&mut self, source: &str) -> Result<String, JsRuntimeError>;
+    fn microtask_checkpoint(&mut self) -> Result<(), JsRuntimeError>;
+    fn collect_garbage(&mut self) -> Result<(), JsRuntimeError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JsRuntimeError {
+    pub code: i32,
+}
+
+impl std::fmt::Display for JsRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "JavaScript Runtime adapter error {}", self.code)
+    }
+}
+
+impl std::error::Error for JsRuntimeError {}
+
+impl From<i32> for JsRuntimeError {
+    fn from(code: i32) -> Self {
+        Self { code }
+    }
+}
+
 #[cfg(target_os = "freebsd")]
 mod native {
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -97,6 +128,20 @@ mod native {
         }
     }
 
+    impl super::JsRuntime for V8Runtime {
+        fn evaluate_to_string(&mut self, source: &str) -> Result<String, super::JsRuntimeError> {
+            self.eval(source).map_err(Into::into)
+        }
+
+        fn microtask_checkpoint(&mut self) -> Result<(), super::JsRuntimeError> {
+            self.run_microtasks().map_err(Into::into)
+        }
+
+        fn collect_garbage(&mut self) -> Result<(), super::JsRuntimeError> {
+            self.collect_garbage().map_err(Into::into)
+        }
+    }
+
     impl SpiderMonkeyRuntime {
         pub fn new() -> Result<Self, &'static str> {
             NonNull::new(unsafe { aibe_spidermonkey_create() })
@@ -136,6 +181,26 @@ pub use native::{SpiderMonkeyRuntime, V8Runtime};
 #[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::{SpiderMonkeyRuntime, V8Runtime};
+
+    #[test]
+    fn selected_v8_implements_the_engine_agnostic_runtime_contract() {
+        use super::JsRuntime;
+
+        fn evaluate_through_project_contract(runtime: &mut dyn JsRuntime) -> String {
+            runtime
+                .evaluate_to_string("6 * 7")
+                .expect("project Runtime contract evaluates")
+        }
+
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        assert_eq!(evaluate_through_project_contract(&mut runtime), "42");
+        runtime
+            .microtask_checkpoint()
+            .expect("project contract performs microtask checkpoint");
+        runtime
+            .collect_garbage()
+            .expect("project contract collects garbage");
+    }
 
     #[test]
     fn v8_rust_owned_lifecycle_and_basic_evaluation() {
