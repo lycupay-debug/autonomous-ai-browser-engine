@@ -708,3 +708,66 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 2. 定义真实 Renderer runtime rootfs 组装策略，确保系统运行库只读、每个 Renderer 的 `/tmp` 与 `/run` 独立，且不向 Jail 暴露宿主敏感目录。
 3. 将 Capsicum FD rights / close-on-exec allowlist 与 Jail IPC 组合，完成正向及负向测试。
 4. 在实际 V8 Renderer 负载下采集资源峰值，再制定每 Jail 的 RCTL 限额；GSM 与 PostgreSQL 始终保持在限制范围之外。
+
+
+## 增量研发记录｜2026-11-02（Rust RendererSupervisor × FreeBSD Jail 集成）
+
+### 架构实施
+
+- PR #8 已合并至 `main`；本次开发基于合并后的 `main`，独立分支继续实现 Rust Supervisor 集成。
+- 新增 FreeBSD `RendererSupervisor::spawn_in_jail()`：先创建 `persist` Jail，再创建 Jail 专属 devfs mount/ruleset，按配置应用 Jail-scoped RCTL deny 规则，最后通过 `jexec -u nobody` 启动 Renderer。资源规则在 Renderer 启动前安装，避免 Renderer 先运行再限额的竞态。
+- 每个 Renderer 必须使用独立 rootfs；拒绝宿主 `/`、rootfs 重用、rootfs 非 root 所有、group/world 可写运行时文件、越界 symlink、非规范路径及无效 RCTL 值。rootfs parent 必须 root-owned，若可被 group/world 写入则必须具备 sticky bit。
+- UDS socket 位于 rootfs 内的 `/run/broker.sock`，owner 为预期 Renderer UID/GID，mode 0600；host listener 设置 `FD_CLOEXEC`。Supervisor 只接受 UID/GID 符合预期、内核 `ki_jid` 对应当前 Jail、且 peer PID 是 `jexec` 本身或其直接子进程的连接。
+- 进程身份进一步绑定 PID、JID、UID 与 `ki_start` 时间，防止 PID 重用被误认为原 Renderer。Supervisor 记录实际 Renderer PID，而不是假定 Jail launcher PID 就是 Renderer PID。
+- Jail 退出/终止时，Supervisor 销毁 Jail、回收后代进程、移除该 Jail 的 RCTL 规则、卸载 devfs 并删除临时 ruleset；按 `cleanup_rootfs_on_exit` 决定是否删除专属 rootfs。Renderer exit 会触发 Storage/Snapshot grants 清理。
+- 原 host-process launch API 已更名为 `spawn_unisolated_for_test`，明确标注仅供生命周期测试；生产 page-controlled Renderer 应使用 `spawn_in_jail`。
+
+### rootfs 与设备边界
+
+- 新增 `scripts/build-renderer-rootfs.sh`：基于 `ldd` 收集 Renderer 的动态依赖，包含 FreeBSD ELF loader、base libraries 和 V8 runtime libraries；生成 root-owned、运行时不可由非 root 修改的 rootfs，建立独立 `/run`、sticky `/tmp`、`/dev` 与 `/proc` mountpoint，并写入 runtime manifest。
+- V8 runtime libraries 在源文件无 immutable flags 时可使用只读 hardlink，减少每 Renderer rootfs 的磁盘复制；带 `schg` 的系统库改为复制，并只清除副本的 immutable flags，未修改宿主系统库的 flags。
+- Supervisor 为每个 Jail 创建独立 devfs ruleset：先 hide all，再只开放 `null`、`zero`、`random`、`urandom`、`fd` 和标准 I/O 设备；Jail teardown 后卸载 mount 并删除 ruleset。未暴露 bpf、zfs、fuse 等其他设备。
+- Jail 设置 `ip4=disable`、`ip6=disable`、`enforce_statfs=2`；集成测试检查 `jls` 参数为 IPv4/IPv6 disabled。
+
+### Capsicum 与真实 V8 集成
+
+- `snapshot-bridge-renderer` 先连接 UDS、加载 V8 runtime、创建 Realm 并初始化可信 host objects；随后调用 `enter_renderer_capability_mode()` 验证 `cap_getmode()==1`，再读取/解析不可信 Snapshot 并执行 V8 DOM wrapper ingestion。
+- 新增 FreeBSD Supervisor Jail integration tests：静态测试 Renderer 在进入 Capsicum 后仍可使用预先建立的 UDS；路径访问返回 `ECAPMODE`；Renderer exec 前后 FD 扫描确认没有继承 host listener 或非预期 FD；`/dev/urandom` 可用而 `/dev/bpf` 不可见。
+- 测试使用 `maxproc=2/jail`：允许 Renderer 与一个子进程，拒绝第二次 fork（`EAGAIN`）；验证 RCTL 规则随 Jail teardown 删除。其他资源限额接口已实现，但默认空配置，不设置生产限额。
+- 实际 V8 E2E：两个 V8 Snapshot Renderer 同时运行在两个独立 Jail 中；分别处理同一 Browser DOM Snapshot，在 Capsicum capability mode 下完成 V8 wrapper 验证；Supervisor 关闭 UDS 后回收两个 Renderer/Jail，并清理 grants、devfs、RCTL 与 rootfs。
+
+### 资源采样（短时快照，非峰值）
+
+两实例并发、处理一个小型 DOM Snapshot 后采样：
+
+| 指标 | Renderer A | Renderer B |
+|---|---:|---:|
+| `memoryuse` | 35 MiB | 35 MiB |
+| `ps RSS` | 35,748 KB | 35,740 KB |
+| `vmemoryuse` | 1,444 GiB | 1,444 GiB |
+| `swapuse` | 约 1,483 GiB | 约 1,500 GiB |
+| `openfiles` | 40 | 40 |
+| `maxproc` | 1 | 1 |
+| `nthr` | 2 | 2 |
+| `ps VSZ` | 1,513,724,788 KB | 1,513,724,788 KB |
+
+- `memoryuse` 与 `ps RSS` 在该次样本中接近；V8 的 `vmemoryuse`/`swapuse` 远高于 RSS，说明其虚拟地址空间预留不能直接作为物理内存预算。
+- 上述只是启动后短时间、单个小型 Snapshot 的快照，不是稳态/峰值；尚未进行长时间、复杂页面或 10/50/100 Renderer 压测。禁止据此设置生产 memoryuse/vmemoryuse/swapuse 限额。
+
+### 验证结果
+
+- FreeBSD 15.1-RELEASE-p6：Rust Workspace **191/191 passed**。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`：通过。
+- `git diff --check`：通过。
+- `scripts/run-security-pocs.sh`：全部通过，包含 Capsicum FD rights、Broker/Renderer IPC、UDS peer credentials、per-Origin storage、SCM_RIGHTS malformed-FD cleanup、Renderer crash recovery、Jail IPv4 isolation、单 Renderer Jail lifecycle/identity/RCTL。
+- 双真实 V8 Renderer 并发 Jail/Capsicum 集成测试通过；所有临时 Jail、RCTL 规则、devfs mount/ruleset 与 rootfs 均已清理。`jls` 无残留，`rctl` 无残留，devfs 仅剩系统默认 rulesets。
+- GSM health `ok`、`max_parallel=8`；PostgreSQL 正常。未重启服务、未改持久 `/etc/jail.conf`/`rctl.conf`/`rc.conf`、未设置全局/root/postgres 规则。
+
+### 未完成边界与下一步
+
+1. 实现完整 Renderer FD rights allowlist；当前已验证 FD 不继承与 Capsicum path restriction，但尚未为每个已打开 FD 设定最终 `cap_rights_limit`。
+2. 将 SCM_RIGHTS descriptor transfer 与 grant authorization 从独立 PoC 接入实际 Jail Broker/Renderer IPC。
+3. 接入 Network Service/Broker，确保网页网络请求由宿主授权路径代理，不直接开放 Jail 网络。
+4. 对真实 V8 Renderer 进行 10/50/100 并发、复杂页面、长时间运行、崩溃与强制回收测试；采集 memoryuse/RSS、虚拟地址、文件描述符、线程、启动和 teardown 分布后再制定生产 RCTL 预算。
+5. 当前仍是 Snapshot bridge Renderer，不代表完整浏览器 Renderer 已完成，也未部署为生产服务。

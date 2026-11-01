@@ -89,6 +89,8 @@ version = "0.1.0"
 dependencies = [
  "aibe-broker-policy-poc",
  "aibe-control-protocol-uds-poc",
+ "aibe-origin-policy-poc",
+ "libc",
 ]
 
 [[package]]

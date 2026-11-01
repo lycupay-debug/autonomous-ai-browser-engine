@@ -7,3 +7,9 @@ publish = false
 [dependencies]
 aibe-broker-policy-poc = { path = "../broker-policy" }
 aibe-control-protocol-uds-poc = { path = "../control-protocol/uds-poc" }
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+aibe-origin-policy-poc = { path = "../origin-policy" }
