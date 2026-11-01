@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 1'
 
 permissions:
   contents: read
@@ -27,3 +29,30 @@ jobs:
         run: cargo +1.98.1 test --workspace --locked
       - name: Run Clippy
         run: cargo +1.98.1 clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  supply-chain:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Install pinned Rust 1.98.1
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Install cargo-audit 0.22.2
+        run: cargo +1.98.1 install cargo-audit --version 0.22.2 --locked
+      - name: Audit Rust dependencies against RustSec advisories
+        run: cargo +1.98.1 audit --locked
+      - name: Install cargo-cyclonedx 0.5.9
+        run: cargo +1.98.1 install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate per-crate CycloneDX SBOMs
+        run: ./scripts/generate-sbom.sh
+      - name: Validate SBOM set and format
+        run: python3 scripts/validate-sbom.py
+      - name: Upload CycloneDX SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibe-phase0-cyclonedx-sbom
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+          retention-days: 90

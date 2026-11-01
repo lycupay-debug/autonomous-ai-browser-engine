@@ -83,10 +83,10 @@ All three candidates returned identical checksums. In a separate timed run of th
 - Millisecond timing has limited resolution; the integer results near 3 ms are especially coarse.
 - The object allocation case is not a controlled GC benchmark. Heap retention and collection behavior need dedicated stress tests.
 
-## Provisional assessment — not a final decision
+## Historical provisional assessment — superseded by ADR-0001
 
-1. V8 is currently the raw-performance leader in this narrow benchmark and has a working FreeBSD C++ embedding PoC. Its compile-time configuration and native dependency surface require careful pinning and maintenance.
-2. SpiderMonkey also has a working FreeBSD C++ embedding PoC and passes the same Test262 subset. Its JSAPI rooting and realm model are mature, but it adds a C++ FFI boundary and the tested package has a larger shell/runtime footprint.
-3. Boa offers the cleanest Rust integration and lowest measured memory footprint in this test, but its performance gap is large and its browser/API maturity remains unproven.
+The original comparison snapshot intentionally left the runtime undecided. That assessment is retained as historical evidence and must not be read as the current decision.
 
-**No runtime has been selected.** The next comparison must add Rust FFI adapters, identical GC/object-retention stress tests, Worker/Promise integration, full dependency and license review, security/JIT hardening, memory ceilings, and broader Test262/WPT coverage. The final choice must optimize total browser capability, maintainability and FreeBSD security—not just microbenchmark speed.
+On 2026-11-01, the project owner selected **V8 15.6.75.19** as the primary JavaScript Runtime after reviewing the FreeBSD embedding, Rust FFI lifecycle, isolated contexts, GC wrapper prototype, Test262 subset and comparative microbenchmarks. SpiderMonkey 153.1.0_2 remains a tested fallback; Boa 0.22.0 is not the primary runtime.
+
+The decision, security constraints, required integration work and reversal conditions are recorded in [`docs/adr/0001-javascript-runtime-v8.md`](../adr/0001-javascript-runtime-v8.md). The selected runtime is not a claim that V8 alone provides browser APIs, DOM, HTML Event Loop semantics or an OS Renderer Sandbox.

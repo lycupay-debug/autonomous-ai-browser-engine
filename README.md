@@ -4,7 +4,7 @@ A FreeBSD-native, AI-first browser engine research and development project.
 
 ## Project status
 
-This repository is in **Phase 0: technical feasibility research**. It is not a usable browser and does not claim Web compatibility. All architecture choices remain provisional until supported by reproducible experiments.
+This repository is in **Phase 0: technical feasibility research**. It is not a usable browser and does not claim Web compatibility. The project owner has selected V8 15.6.75.19 as the primary JavaScript Runtime; Phase 0 still has open security and integration exit conditions.
 
 ## Principles
 
@@ -23,9 +23,10 @@ This repository is in **Phase 0: technical feasibility research**. It is not a u
 - `experiments/js-runtime/native-embed/`: FreeBSD V8 and SpiderMonkey C++ embedding PoCs.
 - `experiments/js-runtime/ffi-poc/`: Rust-owned RAII wrappers over native V8 and SpiderMonkey C ABI.
 - `experiments/js-runtime/benchmarks/`: common cross-runtime JavaScript microbenchmark.
-- `experiments/security/`: FreeBSD Capsicum Broker/Renderer and Jail network-isolation negative-test PoCs.
-- `experiments/headless/raster-poc/`: CPU glyph rasterization and PNG output PoC.
-- `experiments/network-policy/`: outbound IP classification and DNS answer-set policy PoC.
+- `experiments/security/`: FreeBSD Capsicum, per-origin storage descriptor, crash-recovery, peer-credential and Jail network-isolation PoCs.
+- `experiments/headless/raster-poc/`: OpenType shaping, CPU glyph rasterization and PNG/JPEG/GIF/WebP decode PoC.
+- `experiments/network-policy/`: outbound IP policy, pinned TCP/TLS, SNI/certificate verification and per-redirect revalidation PoC.
+- `docs/adr/`: accepted architecture decision records.
 - `experiments/control-protocol/uds-poc/`: versioned JSON-over-UDS contract and task-state tests.
 - `docs/phase-0/`: Phase 0 scope, capability matrix, evidence, dependency audit and exit criteria.
 - `.github/workflows/`: hosted CI checks; this is not a FreeBSD-native test result.
@@ -35,9 +36,9 @@ This repository is in **Phase 0: technical feasibility research**. It is not a u
 On a FreeBSD 15.1 amd64 host with Rust/Cargo installed:
 
 ```sh
-cargo test --workspace --locked
+AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib AIBE_V8_EXECUTABLE=/tmp/aibe-runtime-root/usr/local/bin/d8 cargo test --workspace --locked -- --test-threads=1
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib AIBE_V8_EXECUTABLE=/tmp/aibe-runtime-root/usr/local/bin/d8 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ./scripts/run-test262-subset.sh
 AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local ./scripts/build-native-js-runtimes.sh
 AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib AIBE_V8_EXECUTABLE=/tmp/aibe-runtime-root/usr/local/bin/d8 cargo test -p aibe-js-runtime-ffi-poc --locked
@@ -45,10 +46,11 @@ AIBE_RUNTIME_PREFIX=/tmp/aibe-runtime-root/usr/local ./scripts/run-test262-shell
 clang -Wall -Wextra -Werror -O2 experiments/security/capsicum-minimal/src/main.c -o /tmp/aibe-capsicum-minimal
 /tmp/aibe-capsicum-minimal
 ./scripts/run-security-pocs.sh
+./scripts/run-network-poc.sh
 ```
 
-The Test262 runners execute a pinned, deliberately limited synchronous subset across Boa, V8 and SpiderMonkey; they are not full Test262 conformance. The V8/SpiderMonkey scripts require FreeBSD runtime packages extracted under `/tmp` as documented in `docs/phase-0/js-runtime-comparison.md`. The Capsicum test demonstrates only descriptor-rights and capability-mode restrictions. It is not a browser sandbox or proof of renderer isolation. The headless raster PoC requires an external font file and does not implement shaping or layout.
+The Test262 runners execute a pinned, deliberately limited synchronous subset across Boa, V8 and SpiderMonkey; they are not full Test262 conformance. The V8/SpiderMonkey scripts require FreeBSD runtime packages extracted under `/tmp` as documented in `docs/phase-0/js-runtime-comparison.md`. Security experiments are narrow primitives, not a complete renderer sandbox. The network probe follows only bounded HTTPS response headers with socket timeouts and is not a complete Fetch implementation. The headless PoC exercises one shaped text run and common image formats, not CSS layout or a full rendering engine. Five Cargo-only CycloneDX 1.5 SBOMs are stored under `sbom/`; native system packages and assets are outside their scope.
 
 ## Decisions and licensing
 
-The final JavaScript runtime, renderer backend, project license, and public API are not selected yet. See `docs/phase-0/` before treating any candidate as an adopted decision.
+V8 15.6.75.19 is the accepted primary JavaScript Runtime; SpiderMonkey remains a fallback candidate. See `docs/adr/0001-javascript-runtime-v8.md`. The project-wide license remains undecided; public repository visibility is not a grant of reuse rights. Cargo metadata reports license declarations for all 207 third-party packages, but no full legal audit or vulnerability scan has been completed.

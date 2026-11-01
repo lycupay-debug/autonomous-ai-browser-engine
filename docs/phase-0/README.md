@@ -73,3 +73,67 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - A separate UDS peer-credential test forks a child, drops it to the existing `nobody` account, and connects it to a temporary local socket.
 - The broker's `getpeereid()` result matches the child's UID/GID (65534/65534). This verifies the FreeBSD kernel peer-identity primitive; it is not yet wired into the Rust protocol broker's authorization policy.
 - Reproducible aggregate security checks are available through `scripts/run-security-pocs.sh`.
+
+
+## Runtime decision — 2026-11-01
+
+- The project owner selected **V8 15.6.75.19** as the primary JavaScript Runtime. SpiderMonkey 153.1.0_2 remains a tested fallback; Boa 0.22.0 is not the primary path.
+- Decision rationale, constraints, reversal conditions and integration obligations are recorded in `docs/adr/0001-javascript-runtime-v8.md`.
+- V8 process-wide platform initialization now runs once. Multiple isolate/context instances have independent global state and lifetimes. The Rust wrapper is thread-affine (`!Send + !Sync`) and the C ABI rejects wrong-thread operations.
+- V8 microtasks use an explicit host checkpoint; this is not the WHATWG HTML Event Loop.
+- A V8 native `Node` wrapper PoC now validates append/childCount, moving a child between parents, rejecting ancestor cycles (preventing native shared-pointer graph leaks), JS self-reference, native parent/child ownership, and GC weak finalization. Wrapper identity/cache, listeners, navigation teardown and Worker lifetimes remain open.
+
+## Network pinned TLS and redirect evidence — 2026-11-01
+
+- `aibe-network-policy-poc` now resolves a hostname once, rejects the entire answer set if any address is disallowed, and connects to the exact validated `SocketAddr`.
+- TLS uses the original URL hostname for SNI and certificate-name verification with the host CA bundle.
+- Each HTTPS redirect triggers a fresh resolve/validate/pinned-connect/TLS cycle. HTTP downgrade and duplicate/missing Location headers are rejected.
+- Live tests: `https://example.com/` returned HTTP 200; `https://httpbin.org/redirect/1` returned 302 then 200 at `https://httpbin.org/get`. The actual connected peer is recorded by the probe.
+- Unit tests cover private target denial, redirect parsing, duplicate Location rejection and downgrade rejection. A third-party proxy blocked the attempted external private-redirect test before the redirect response was returned, so that specific end-to-end case is not claimed as passed.
+- This remains a bounded HTTPS header probe, not a complete Fetch implementation or body-streaming Network Service.
+
+## Headless shaping and image decode evidence — 2026-11-01
+
+- Added Rustybuzz 0.20.1 OpenType shaping before fontdue glyph rasterization.
+- Added image 0.25.10 decoding tests for PNG, JPEG, GIF and WebP.
+- FreeBSD PoC shaped and rasterized the 24-codepoint mixed Latin/Simplified Chinese sample with 0 missing glyphs, 3,248 nonzero coverage pixels, producing a 485×88 PNG which was decoded successfully.
+- Bidi paragraph layout, script itemization, line breaking, font fallback, CSS layout and full paint remain unimplemented.
+
+## Renderer isolation extensions — 2026-11-01
+
+- Per-origin storage capability test: broker passed only Origin A's directory FD; renderer read Origin A but could not traverse into Origin B or create files without delegated write/create rights.
+- Crash recovery test: supervisor observed renderer SIGKILL, spawned a replacement process and completed a health IPC exchange. This is a narrow lifecycle proof, not stateful production recovery.
+- Rust UDS PoC now exposes FreeBSD `getpeereid()` peer credentials, UID authorization, and `accept_authorized_peer()`; the FreeBSD test server uses the authenticated accept path and rejects a mismatched UID. It applies a 64 KiB request cap and 5-second read/write timeout, refuses to unlink pre-existing filesystem entries, and tests oversized input rejection.
+- `kern.racct.enable=0` on the host. rctl enforcement is not currently testable without changing a kernel runtime setting; no sysctl or persistent system configuration was changed.
+- Full Renderer Sandbox remains unproven: cross-Origin process assignment, rctl, hostile IPC under load, network broker, and production crash recovery remain open.
+
+
+## Network response parser hardening — 2026-11-01
+
+- Replaced unbounded `BufRead::read_line` with a bounded incremental line reader: 8 KiB maximum per status/header line and 64 KiB total response headers.
+- Enforced a 100-header ceiling, CRLF termination, valid HTTP status range, rejection of unsupported informational responses, and rejection of control characters in header values.
+- Connect timeout is 8 seconds; TCP read/write timeout is 10 seconds.
+- Added four negative tests: oversized header line, truncated headers, control characters, and informational status. Network policy test count is now 17/17.
+- This reduces unbounded header allocation and indefinite socket wait in the PoC. DNS resolver deadlines and a production-grade HTTP parser remain unimplemented.
+
+## Current verification snapshot — 2026-11-01
+
+- FreeBSD `cargo test --workspace --locked -- --test-threads=1`: 44 passed, 0 failed (Boa 7, UDS 9, Headless 3, V8 FFI 8, Network 17).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed.
+- Native V8 and SpiderMonkey embed builds: both executed `1 + 2` and returned `3`.
+- Test262 fixed subset: V8 284 passed / 0 failed / 10 skipped; SpiderMonkey 284 passed / 0 failed / 10 skipped; Boa uses the same pinned project harness subset as recorded above. These remain limited harness results.
+- Security PoCs: Capsicum FD rights, Broker/Renderer IPC restriction, UDS peer UID/GID, per-Origin storage FD restriction, Renderer SIGKILL/restart health exchange, and Jail IPv4 network denial all passed.
+- Live HTTPS: `example.com` HTTP 200; `httpbin.org/redirect/1` followed 302 to `/get` and returned HTTP 200. The actual connected peer addresses were printed by the test.
+- Headless shaping: 24 input codepoints, 24 shaped glyphs, 0 missing glyphs, 3,248 nonzero coverage pixels, 485×88 PNG successfully decoded.
+- Five CycloneDX 1.5 SBOM files generated for the five Cargo workspace crates. Their component counts are 146, 5, 45, 3 and 53 respectively. SBOMs describe the Cargo graph only; native V8/SpiderMonkey system packages, the temporary font asset and the FreeBSD OS package closure are not included.
+- Cargo metadata: 212 packages total; 207 third-party packages all have declared license metadata. This is not legal approval. Five workspace crates remain `UNLICENSED` pending owner decision.
+- `cargo-audit` installation did not complete in the host tool session; no vulnerability scan is claimed. Add/verify a CI advisory scan before Phase 0 exit.
+
+
+## Authenticated Broker accept path — 2026-11-01
+
+- Added `accept_authorized_peer(listener, expected_uid)` to the Rust UDS PoC. It accepts a socket, obtains kernel peer credentials via FreeBSD `getpeereid()`, and returns the stream only when the UID matches.
+- The FreeBSD UDS test server now uses this authenticated accept helper instead of performing credential checks inline.
+- Added a negative test that connects a local client while the server expects a different UID; the accept path returns `PermissionDenied`.
+- UDS test count is now 9/9 on FreeBSD. The protocol/state-machine server remains test-only; it is not yet the production Browser Broker.

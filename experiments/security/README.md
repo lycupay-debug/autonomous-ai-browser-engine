@@ -1,39 +1,41 @@
 # FreeBSD security feasibility experiments
 
-## Minimal Capsicum descriptor-rights test
+These tests use temporary processes, socketpairs, directories, and Jail roots. They do not modify `/etc/jail.conf`, `/etc/rc.conf`, `/boot/loader.conf`, persistent system accounts, or persistent service configuration.
 
-`capsicum-minimal/src/main.c` prepares an unlinked temporary file, forks a child, reduces the inherited descriptor to `CAP_READ` and `CAP_FSTAT`, and enters Capsicum capability mode.
+## Capsicum descriptor rights
 
-- Reading from the inherited descriptor remains allowed.
-- Writing through the descriptor is denied with `ENOTCAPABLE`.
-- Opening `/etc/passwd` by pathname is denied with `ECAPMODE`.
+`capsicum-minimal/src/main.c` prepares an unlinked temporary file, forks a child, reduces the inherited descriptor to `CAP_READ | CAP_FSTAT`, and enters capability mode. Reading remains allowed; writing returns `ENOTCAPABLE`; path-based `/etc/passwd` open returns `ECAPMODE`.
 
-## Broker/Renderer process-boundary prototype
+## Broker/Renderer process boundary
 
-`broker-renderer-capsicum-poc.c` forks a restricted renderer process over a Unix socketpair. The renderer closes all inherited descriptors except the IPC channel, limits the channel to read/write/stat rights, enters Capsicum capability mode, and answers a broker request. It then verifies that path-based file open is denied with `ECAPMODE` and that an IPv4 socket cannot connect when `CAP_CONNECT` is omitted from that socket's rights. Socket creation itself remains permitted in capability mode on this host.
+`broker-renderer-capsicum-poc.c` forks a renderer over a Unix socketpair. The renderer closes all other inherited descriptors, limits the IPC channel to `CAP_READ | CAP_WRITE | CAP_FSTAT`, enters capability mode, and responds to a broker request. Path-based open is denied. An IPv4 socket can still be created in capability mode, but removing `CAP_CONNECT` from its rights makes outbound `connect()` fail with `ENOTCAPABLE`. Do not claim that `cap_enter()` alone blocks socket creation.
 
-Important observation: `socket(AF_INET, ...)` itself is allowed in capability mode on this host. The outbound connection is denied by descriptor-rights restriction. The test therefore does not claim that `cap_enter()` alone blocks socket creation.
+## Per-origin storage descriptor isolation
 
-## Jail network negative test
+`origin-storage-capsicum-poc.c` creates two temporary origin storage directories. The broker passes only Origin A's directory FD to the renderer. After descriptor restriction and `cap_enter()`, the renderer can read Origin A, cannot traverse to Origin B, and cannot create a file because write/create rights were not delegated. This tests an OS capability boundary, not the complete web Origin model or cookie/storage semantics.
 
-`jail-network-probe.c` tests the same host-local IPv4 TCP listener from the host and from a temporary jail configured with `ip4=disable` and `ip6=disable`. The host connection succeeds; inside the jail, IPv4 socket creation is denied with `EPROTONOSUPPORT` (errno 43).
+## Renderer crash recovery
 
-Run the repeatable test:
+`renderer-supervisor-poc.c` kills a child renderer with `SIGKILL`, verifies the supervisor observes the signal, starts a replacement process, and completes a health IPC exchange. This is a basic process-supervision proof, not production recovery with state restoration, backoff, or compromised-process forensics.
 
-```sh
-./scripts/run-jail-network-poc.sh
-```
+## Jail network isolation
 
-All experiments use temporary files, processes, and Jail roots. They do not modify `/etc/jail.conf`, `/etc/rc.conf`, `/boot/loader.conf`, or persistent system configuration.
+`jail-network-probe.c` connects to a host-local IPv4 TCP listener from the host and from a temporary Jail configured with `ip4=disable` and `ip6=disable`. Host baseline succeeds; the jail cannot create an IPv4 socket (`EPROTONOSUPPORT`, errno 43).
 
-These tests are narrow primitives, not a complete browser renderer sandbox. They do not test IPC peer UID/GID authentication, rctl, compromised payloads, cross-Origin/Storage isolation, renderer crash recovery, or a full Broker/Renderer service architecture.
+## UDS peer UID/GID authentication
 
-## UDS peer UID/GID authentication primitive
+`uds-peer-credentials-poc.c` drops a child to the existing `nobody` account, connects to a temporary UDS listener, and verifies `getpeereid()` returns the child's UID/GID (65534/65534). The Rust UDS PoC also exposes a FreeBSD-only `peer_credentials()` and `authorize_peer_uid()` function, checks the accepted peer UID in its FreeBSD test server, and has a kernel-credential integration test.
 
-`uds-peer-credentials-poc.c` creates a temporary UDS listener with mode 0666, forks a child, drops the child to the `nobody` account, and has it connect. The broker calls FreeBSD `getpeereid()` on the accepted connection and verifies the peer UID/GID match the dropped child. The test is run as root and does not create or modify any system account.
+The Rust protocol test server additionally bounds a request to 64 KiB, applies read/write timeouts, rejects an existing filesystem entry rather than unlinking it, and tests oversized input rejection. The authenticated accept helper is wired into the FreeBSD test server, but the protocol/state-machine implementation remains test-only and is not a production Broker.
 
-Run all security PoCs:
+## Resource limits (rctl)
+
+The host currently reports `kern.racct.enable=0`. Consequently, rctl enforcement cannot be meaningfully tested without changing a kernel runtime setting. No sysctl or persistent system configuration was changed. This remains an explicit Phase 0 limitation.
+
+## Run all security PoCs
 
 ```sh
 ./scripts/run-security-pocs.sh
 ```
+
+These experiments do not establish a complete browser Renderer Sandbox. Cross-Origin process policy, actual page-origin assignment, network broker enforcement, `rctl`, hostile IPC payload handling under load, privilege transitions, and production crash recovery remain separate gates.

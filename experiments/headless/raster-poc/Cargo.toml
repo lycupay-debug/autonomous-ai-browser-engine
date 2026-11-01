@@ -7,3 +7,5 @@ publish = false
 [dependencies]
 fontdue = "=0.9.5"
 png = "=0.18.1"
+rustybuzz = "=0.20.1"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
