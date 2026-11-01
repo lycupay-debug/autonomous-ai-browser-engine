@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:95bdb3f4-b9c3-489c-bd9f-6af90cc699f7",
+  "serialNumber": "urn:uuid:f9580511-b9b3-498c-bedb-5abb2f12ef8d",
   "metadata": {
-    "timestamp": "2026-11-01T01:35:49.885642189Z",
+    "timestamp": "2026-11-01T02:25:58.125011217Z",
     "tools": [
       {
         "vendor": "CycloneDX",
@@ -14,7 +14,7 @@
     ],
     "component": {
       "type": "library",
-      "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/ffi-poc#aibe-js-runtime-ffi-poc@0.1.0",
+      "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/ffi-poc#aibe-js-runtime-ffi-poc@0.1.0",
       "name": "aibe-js-runtime-ffi-poc",
       "version": "0.1.0",
       "scope": "required",
@@ -22,7 +22,7 @@
       "components": [
         {
           "type": "library",
-          "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/ffi-poc#aibe-js-runtime-ffi-poc@0.1.0 bin-target-0",
+          "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/ffi-poc#aibe-js-runtime-ffi-poc@0.1.0 bin-target-0",
           "name": "aibe_js_runtime_ffi_poc",
           "version": "0.1.0",
           "purl": "pkg:cargo/aibe-js-runtime-ffi-poc@0.1.0?download_url=file://.#src/lib.rs"
@@ -32,7 +32,7 @@
     "properties": [
       {
         "name": "cdx:rustc:sbom:target:triple",
-        "value": "x86_64-unknown-freebsd"
+        "value": "x86_64-unknown-linux-gnu"
       }
     ]
   },
@@ -131,7 +131,7 @@
   ],
   "dependencies": [
     {
-      "ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/ffi-poc#aibe-js-runtime-ffi-poc@0.1.0",
+      "ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/ffi-poc#aibe-js-runtime-ffi-poc@0.1.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#cc@1.10.0"
       ]

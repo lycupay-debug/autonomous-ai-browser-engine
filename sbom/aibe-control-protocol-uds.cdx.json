@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:8652a1f1-0d4b-4e62-b625-d4441e917b0d",
+  "serialNumber": "urn:uuid:076f6d6a-7395-4a6b-a7ab-29bdeba6687f",
   "metadata": {
-    "timestamp": "2026-11-01T01:35:49.884434318Z",
+    "timestamp": "2026-11-01T02:25:58.124104237Z",
     "tools": [
       {
         "vendor": "CycloneDX",
@@ -14,7 +14,7 @@
     ],
     "component": {
       "type": "library",
-      "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/control-protocol/uds-poc#aibe-control-protocol-uds-poc@0.1.0",
+      "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/control-protocol/uds-poc#aibe-control-protocol-uds-poc@0.1.0",
       "name": "aibe-control-protocol-uds-poc",
       "version": "0.1.0",
       "scope": "required",
@@ -22,7 +22,7 @@
       "components": [
         {
           "type": "library",
-          "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/control-protocol/uds-poc#aibe-control-protocol-uds-poc@0.1.0 bin-target-0",
+          "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/control-protocol/uds-poc#aibe-control-protocol-uds-poc@0.1.0 bin-target-0",
           "name": "aibe_control_protocol_uds_poc",
           "version": "0.1.0",
           "purl": "pkg:cargo/aibe-control-protocol-uds-poc@0.1.0?download_url=file://.#src/lib.rs"
@@ -32,7 +32,7 @@
     "properties": [
       {
         "name": "cdx:rustc:sbom:target:triple",
-        "value": "x86_64-unknown-freebsd"
+        "value": "x86_64-unknown-linux-gnu"
       }
     ]
   },
@@ -202,7 +202,7 @@
   ],
   "dependencies": [
     {
-      "ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/control-protocol/uds-poc#aibe-control-protocol-uds-poc@0.1.0",
+      "ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/control-protocol/uds-poc#aibe-control-protocol-uds-poc@0.1.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.154"
       ]

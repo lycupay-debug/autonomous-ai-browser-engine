@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:10b2cd37-0fc6-4633-aa98-037ac9d9919e",
+  "serialNumber": "urn:uuid:ba94dbb2-e91f-45d0-8f28-cb8f61e927af",
   "metadata": {
-    "timestamp": "2026-11-01T01:35:49.879123547Z",
+    "timestamp": "2026-11-01T02:25:58.120274741Z",
     "tools": [
       {
         "vendor": "CycloneDX",
@@ -14,7 +14,7 @@
     ],
     "component": {
       "type": "application",
-      "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0",
+      "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0",
       "name": "aibe-boa-host-poc",
       "version": "0.1.0",
       "scope": "required",
@@ -22,28 +22,28 @@
       "components": [
         {
           "type": "library",
-          "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-0",
+          "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-0",
           "name": "aibe_boa_host_poc",
           "version": "0.1.0",
           "purl": "pkg:cargo/aibe-boa-host-poc@0.1.0?download_url=file://.#src/lib.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-1",
+          "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-1",
           "name": "boa-bench",
           "version": "0.1.0",
           "purl": "pkg:cargo/aibe-boa-host-poc@0.1.0?download_url=file://.#src/bin/boa-bench.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-2",
+          "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-2",
           "name": "run-script",
           "version": "0.1.0",
           "purl": "pkg:cargo/aibe-boa-host-poc@0.1.0?download_url=file://.#src/bin/run-script.rs"
         },
         {
           "type": "application",
-          "bom-ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-3",
+          "bom-ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0 bin-target-3",
           "name": "test262_subset",
           "version": "0.1.0",
           "purl": "pkg:cargo/aibe-boa-host-poc@0.1.0?download_url=file://.#src/bin/test262_subset.rs"
@@ -53,7 +53,7 @@
     "properties": [
       {
         "name": "cdx:rustc:sbom:target:triple",
-        "value": "x86_64-unknown-freebsd"
+        "value": "x86_64-unknown-linux-gnu"
       }
     ]
   },
@@ -4382,7 +4382,7 @@
   ],
   "dependencies": [
     {
-      "ref": "path+file:///opt/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0",
+      "ref": "path+file:///home/runner/work/autonomous-ai-browser-engine/autonomous-ai-browser-engine/experiments/js-runtime/boa-host#aibe-boa-host-poc@0.1.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#boa_engine@0.22.0",
         "registry+https://github.com/rust-lang/crates.io-index#boa_gc@0.22.0"
@@ -4908,10 +4908,7 @@
       ]
     },
     {
-      "ref": "registry+https://github.com/rust-lang/crates.io-index#num_threads@0.1.8",
-      "dependsOn": [
-        "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.191"
-      ]
+      "ref": "registry+https://github.com/rust-lang/crates.io-index#num_threads@0.1.8"
     },
     {
       "ref": "registry+https://github.com/rust-lang/crates.io-index#once_cell@1.21.4"
