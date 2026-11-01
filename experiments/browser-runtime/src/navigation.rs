@@ -585,21 +585,36 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         Ok(detached + 1)
     }
 
-    /// Creates a Dedicated Worker Realm for a script URL that resolves to the
-    /// owning Document's canonical Origin Group. Redirect/fetch checks remain
-    /// unimplemented; this validates only the initial script URL origin.
-    pub fn create_dedicated_worker(
+    /// Creates a Dedicated Worker when the requested URL, every redirect
+    /// target, and the final response URL remain same-origin with the owner.
+    /// The caller must supply the redirect chain reported by its Network Loader.
+    pub fn create_dedicated_worker_after_fetch(
         &mut self,
         owner_document: DocumentId,
-        script_url: &str,
+        requested_script_url: &str,
+        redirect_urls: &[&str],
+        final_response_url: &str,
     ) -> Result<WorkerId, NavigationError<R::Error>> {
         let owner_origin = self
             .documents
             .get(&owner_document)
             .ok_or(NavigationError::UnknownDocument)?
             .origin;
-        let id = self.allocate_worker_id()?;
-        let realm = self.coordinator.create_realm_for_url(script_url)?;
+        let urls = std::iter::once(requested_script_url)
+            .chain(redirect_urls.iter().copied())
+            .chain(std::iter::once(final_response_url));
+        for url in urls {
+            if !self
+                .coordinator
+                .url_matches_origin_group(owner_origin, url)?
+            {
+                return Err(NavigationError::CrossOriginWorkerScript);
+            }
+        }
+
+        // Only create a JavaScript Realm after the entire loader-reported
+        // redirect chain has passed the owner Document's Origin check.
+        let realm = self.coordinator.create_realm_for_url(final_response_url)?;
         let origin = match self.coordinator.origin_group_for_realm(realm) {
             Some(origin) => origin,
             None => {
@@ -613,18 +628,29 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             self.coordinator.destroy_realm(realm)?;
             return Err(NavigationError::CrossOriginWorkerScript);
         }
+        let id = self.allocate_worker_id()?;
         self.workers.insert(
             id,
             DedicatedWorker {
                 id,
                 owner_document,
-                script_url: script_url.to_owned(),
+                script_url: final_response_url.to_owned(),
                 origin,
                 realm,
                 state: WorkerState::Running,
             },
         );
         Ok(id)
+    }
+
+    /// Creates a Worker for an already-resolved URL with no redirects. Real
+    /// network loads should call `create_dedicated_worker_after_fetch`.
+    pub fn create_dedicated_worker(
+        &mut self,
+        owner_document: DocumentId,
+        script_url: &str,
+    ) -> Result<WorkerId, NavigationError<R::Error>> {
+        self.create_dedicated_worker_after_fetch(owner_document, script_url, &[], script_url)
     }
 
     /// Marks a Worker Terminating before destroying its Realm. If Runtime

@@ -179,6 +179,18 @@ impl<R: OriginRealmRuntime> OriginRealmCoordinator<R> {
         self.realm_origins.get(&realm).copied()
     }
 
+    /// Checks a URL against a live host-issued Origin Group without creating
+    /// a temporary JS Realm or extending that group's lifetime.
+    pub fn url_matches_origin_group(
+        &self,
+        origin: OriginGroupId,
+        url: &str,
+    ) -> Result<bool, BrowserRuntimeOriginError<R::Error>> {
+        self.registry
+            .url_matches_origin(origin, url)
+            .map_err(BrowserRuntimeOriginError::Origin)
+    }
+
     pub fn active_realm_count_for_origin(&self, origin: OriginGroupId) -> usize {
         self.active_origins
             .get(&origin)
@@ -716,6 +728,71 @@ mod tests {
         controller.terminate_worker(worker).unwrap();
         assert_eq!(controller.active_worker_count(), 0);
         assert!(controller.terminate_worker(worker).is_err());
+    }
+
+    #[test]
+    fn dedicated_worker_accepts_same_origin_redirect_chain_and_uses_final_url() {
+        use super::navigation::NavigationController;
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        let worker = controller
+            .create_dedicated_worker_after_fetch(
+                document,
+                "https://a.example/worker.js",
+                &["https://a.example/assets/worker-v2.js"],
+                "https://a.example/assets/worker-v2.js",
+            )
+            .unwrap();
+        let record = controller.worker(worker).unwrap();
+        assert_eq!(record.script_url(), "https://a.example/assets/worker-v2.js");
+        assert_eq!(
+            record.origin(),
+            controller.document(document).unwrap().origin()
+        );
+        assert_eq!(controller.active_worker_count(), 1);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn dedicated_worker_rejects_cross_origin_intermediate_redirect_without_realm_leak() {
+        use super::navigation::{NavigationController, NavigationError};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        assert!(matches!(
+            controller.create_dedicated_worker_after_fetch(
+                document,
+                "https://a.example/worker.js",
+                &[
+                    "https://cdn.example/worker.js",
+                    "https://a.example/final-worker.js",
+                ],
+                "https://a.example/final-worker.js",
+            ),
+            Err(NavigationError::CrossOriginWorkerScript)
+        ));
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn dedicated_worker_rejects_cross_origin_final_response_without_realm_leak() {
+        use super::navigation::{NavigationController, NavigationError};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        assert!(matches!(
+            controller.create_dedicated_worker_after_fetch(
+                document,
+                "https://a.example/worker.js",
+                &["https://a.example/redirected.js"],
+                "https://b.example/final.js",
+            ),
+            Err(NavigationError::CrossOriginWorkerScript)
+        ));
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
     }
 
     #[test]

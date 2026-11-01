@@ -88,6 +88,18 @@ impl OriginRegistry {
         self.intern_origin(UrlOrigin::new_opaque())
     }
 
+    /// Checks a URL against an already-issued origin without interning a new
+    /// group or changing its lifetime. Opaque origins never match URL origins.
+    pub fn url_matches_origin(
+        &self,
+        expected: OriginGroupId,
+        input: &str,
+    ) -> Result<bool, OriginPolicyError> {
+        self.validate(expected)?;
+        let url = Url::parse(input).map_err(OriginPolicyError::InvalidUrl)?;
+        Ok(self.tuple_origins.get(&expected.group_id) == Some(&url.origin()))
+    }
+
     /// Explicitly propagates a creator's origin to an inherited-origin context.
     /// This is not inferred from `about:blank` or `about:srcdoc` URL text.
     pub fn inherit(&self, parent: OriginGroupId) -> Result<OriginGroupId, OriginPolicyError> {
@@ -244,6 +256,40 @@ mod tests {
                 "opaque origin for {url} must be unique per creation"
             );
         }
+    }
+
+    #[test]
+    fn url_origin_check_matches_canonical_tuple_origin_without_interning() {
+        let mut registry = OriginRegistry::new().unwrap();
+        let expected = registry.resolve_url("https://example.com/start").unwrap();
+        let other = registry.resolve_url("https://other.example/").unwrap();
+        let issued_before = registry.issued_groups.len();
+
+        assert!(
+            registry
+                .url_matches_origin(expected, "https://EXAMPLE.com:443/worker.js")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .url_matches_origin(expected, "https://other.example/worker.js")
+                .unwrap()
+        );
+        assert_eq!(registry.issued_groups.len(), issued_before);
+        assert!(registry.validate(expected).is_ok());
+        assert!(registry.validate(other).is_ok());
+    }
+
+    #[test]
+    fn url_origin_check_never_matches_an_opaque_origin() {
+        let mut registry = OriginRegistry::new().unwrap();
+        let opaque = registry.create_opaque_origin().unwrap();
+        assert!(
+            !registry
+                .url_matches_origin(opaque, "https://example.com/worker.js")
+                .unwrap()
+        );
+        assert!(registry.validate(opaque).is_ok());
     }
 
     #[test]
