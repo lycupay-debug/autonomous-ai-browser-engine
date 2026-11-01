@@ -5,6 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+libc = "=0.2.191"
 aibe-browser-runtime-origin-poc = { path = "../browser-runtime" }
 aibe-broker-policy-poc = { path = "../broker-policy" }
 aibe-control-protocol-uds-poc = { path = "../control-protocol/uds-poc" }

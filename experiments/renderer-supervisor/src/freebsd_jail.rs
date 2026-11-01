@@ -61,6 +61,7 @@ impl RendererSupervisor {
         use std::os::unix::fs::PermissionsExt;
 
         validate_jail_config(config)?;
+        let renderer_id = super::next_renderer_id()?;
         if jail_id(&config.name)?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -269,7 +270,8 @@ impl RendererSupervisor {
             .arg(&config.socket_path)
             .env_clear()
             .env("PATH", "/bin:/usr/bin:/usr/sbin")
-            .env("HOME", "/nonexistent");
+            .env("HOME", "/nonexistent")
+            .env("AIBE_RENDERER_INSTANCE_ID", renderer_id.value().to_string());
         if let Some(library_path) = &config.library_path {
             launcher_command.env("LD_LIBRARY_PATH", library_path);
         }
@@ -287,6 +289,7 @@ impl RendererSupervisor {
             &config.name,
             config.expected_uid,
             config.expected_gid,
+            renderer_id,
             connect_timeout,
         );
         drop(listener);
@@ -771,6 +774,7 @@ fn accept_jail_child(
     jail_name: &str,
     expected_uid: u32,
     expected_gid: u32,
+    renderer_id: RendererId,
     connect_timeout: Duration,
 ) -> io::Result<(UnixStream, RendererPrincipal, i32, (i64, i64))> {
     let deadline = Instant::now() + connect_timeout;
@@ -803,15 +807,8 @@ fn accept_jail_child(
                     drop(stream);
                     continue;
                 }
-                let instance = NEXT_RENDERER_INSTANCE
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        current.checked_add(1)
-                    })
-                    .map_err(|_| io::Error::other("Renderer instance ID exhausted"))?;
-                let id = RendererId::new(instance)
-                    .ok_or_else(|| io::Error::other("Renderer instance ID is zero"))?;
                 let principal = RendererPrincipal::new(
-                    id,
+                    renderer_id,
                     credentials.pid,
                     credentials.uid,
                     credentials.gid,

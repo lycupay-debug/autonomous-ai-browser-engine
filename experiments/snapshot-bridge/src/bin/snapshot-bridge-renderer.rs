@@ -3,6 +3,11 @@ use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+#[cfg(target_os = "freebsd")]
+use aibe_broker_policy_poc::{RendererId, RendererPrincipal};
+#[cfg(target_os = "freebsd")]
+use aibe_control_protocol_uds_poc::snapshot_descriptor::receive_snapshot_descriptor;
+#[cfg(not(target_os = "freebsd"))]
 use aibe_control_protocol_uds_poc::snapshot_frame::read_dom_snapshot_frame;
 
 #[cfg(target_os = "freebsd")]
@@ -132,25 +137,69 @@ fn main() -> io::Result<()> {
     // capability mode. Untrusted Snapshot parsing and JS evaluation happen
     // only after the Renderer has entered Capsicum.
     #[cfg(target_os = "freebsd")]
-    aibe_renderer_supervisor_poc::enter_renderer_capability_mode()?;
+    let (grant_envelope, payload, expected_principal) = {
+        let instance_id = env::var("AIBE_RENDERER_INSTANCE_ID")
+            .map_err(io::Error::other)?
+            .parse::<u64>()
+            .map_err(io::Error::other)?;
+        let id = RendererId::new(instance_id)
+            .ok_or_else(|| io::Error::other("Renderer instance ID must be nonzero"))?;
+        let principal = RendererPrincipal::new(
+            id,
+            unsafe { libc::getpid() as u32 },
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )
+        .ok_or_else(|| io::Error::other("Renderer process identity is invalid"))?;
+        aibe_renderer_supervisor_poc::fd_policy::apply_renderer_fd_allowlist(&mut stream)?;
+        aibe_renderer_supervisor_poc::enter_renderer_capability_mode()?;
+        let (grant, payload) =
+            receive_snapshot_descriptor(&mut stream, principal).map_err(|error| {
+                eprintln!("Renderer SCM_RIGHTS receive failed: {error}");
+                error
+            })?;
+        (grant, payload, principal)
+    };
 
-    let frame = read_dom_snapshot_frame(&mut stream)?;
-    if frame.request_id != 71 || frame.document_id != 1 || frame.revision != 1 {
+    #[cfg(target_os = "freebsd")]
+    let envelope: serde_json::Value = serde_json::from_slice(&payload).map_err(io::Error::other)?;
+
+    #[cfg(not(target_os = "freebsd"))]
+    let envelope: serde_json::Value = {
+        let frame = read_dom_snapshot_frame(&mut stream)?;
+        if frame.request_id != 71 || frame.document_id != 1 || frame.revision != 1 {
+            return Err(io::Error::other(
+                "unexpected Browser Runtime snapshot identity",
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&frame.payload).map_err(io::Error::other)?;
+        let payload_document_id = value["documentId"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok());
+        let payload_revision = value["revision"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok());
+        if payload_document_id != Some(frame.document_id)
+            || payload_revision != Some(frame.revision)
+        {
+            return Err(io::Error::other(
+                "Snapshot frame identity does not match its payload envelope",
+            ));
+        }
+        value
+    };
+
+    #[cfg(target_os = "freebsd")]
+    if grant_envelope.request_id == 0
+        || grant_envelope.renderer_pid != expected_principal.pid()
+        || grant_envelope.renderer_uid != expected_principal.uid()
+        || grant_envelope.renderer_gid != expected_principal.gid()
+        || grant_envelope.document_id == 0
+        || grant_envelope.revision == 0
+    {
         return Err(io::Error::other(
-            "unexpected Browser Runtime snapshot identity",
-        ));
-    }
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&frame.payload).map_err(io::Error::other)?;
-    let payload_document_id = envelope["documentId"]
-        .as_str()
-        .and_then(|value| value.parse::<u64>().ok());
-    let payload_revision = envelope["revision"]
-        .as_str()
-        .and_then(|value| value.parse::<u64>().ok());
-    if payload_document_id != Some(frame.document_id) || payload_revision != Some(frame.revision) {
-        return Err(io::Error::other(
-            "Snapshot frame identity does not match its payload envelope",
+            "Snapshot FD grant envelope failed Renderer identity validation",
         ));
     }
     if envelope["tree"]["nodes"]
