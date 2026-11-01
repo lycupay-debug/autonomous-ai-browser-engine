@@ -1,10 +1,16 @@
 //! Headless text shaping, glyph rasterization, and image decoding feasibility.
 //!
-//! This is not a browser layout or paint engine. It validates that a Rust-native
-//! shaping/raster/image pipeline can run on the target FreeBSD host.
+//! This is not a browser layout or paint engine. It validates a Rust-native
+//! shaping/raster/image pipeline on the target FreeBSD host. Swash owns font
+//! parsing, Unicode-script shaping, outline scaling, and glyph rasterization;
+//! paragraph layout, bidi reordering, and font fallback remain out of scope.
 
-use fontdue::{Font, FontSettings};
-use rustybuzz::{UnicodeBuffer, shape};
+use swash::{
+    FontRef,
+    scale::{Render, ScaleContext, Source},
+    shape::{Direction, ShapeContext},
+    text::{Codepoint, Script},
+};
 
 #[derive(Debug)]
 pub struct RasterizedText {
@@ -25,42 +31,73 @@ pub fn shape_and_rasterize(
     if !pixel_size.is_finite() || pixel_size <= 0.0 {
         return Err("pixel size must be finite and positive".into());
     }
-    let face = rustybuzz::Face::from_slice(font_bytes, 0)
-        .ok_or_else(|| "OpenType font face could not be parsed".to_string())?;
-    let font = Font::from_bytes(font_bytes, FontSettings::default())
-        .map_err(|error| format!("font rasterizer parse failed: {error}"))?;
 
-    let mut buffer = UnicodeBuffer::new();
-    buffer.push_str(text);
-    buffer.guess_segment_properties();
-    let shaped = shape(&face, &[], buffer);
-    let infos = shaped.glyph_infos();
-    let positions = shaped.glyph_positions();
-    let scale = pixel_size / face.units_per_em() as f32;
+    let font = FontRef::from_index(font_bytes, 0)
+        .ok_or_else(|| "OpenType font face could not be parsed".to_string())?;
+    let missing_glyphs = text
+        .chars()
+        .filter(|character| font.charmap().map(*character) == 0)
+        .count();
+
+    // Itemize this small PoC by Unicode script. Common and inherited
+    // characters stay with the preceding run; a full browser itemizer must
+    // also account for language, direction, style, bidi, and font fallback.
+    let mut runs: Vec<(Script, String)> = Vec::new();
+    for character in text.chars() {
+        let script = match character.properties().script() {
+            Script::Common | Script::Inherited => runs
+                .last()
+                .map(|(script, _)| *script)
+                .unwrap_or(Script::Latin),
+            script => script,
+        };
+        if let Some((last_script, run_text)) = runs.last_mut()
+            && *last_script == script
+        {
+            run_text.push(character);
+            continue;
+        }
+        runs.push((script, character.to_string()));
+    }
+
+    let mut shape_context = ShapeContext::new();
+    let mut shaped_glyphs = Vec::new();
+    for (script, run_text) in &runs {
+        let mut shaper = shape_context
+            .builder(font)
+            .script(*script)
+            .direction(Direction::LeftToRight)
+            .size(pixel_size)
+            .build();
+        shaper.add_str(run_text);
+        shaper.shape_with(|cluster| {
+            shaped_glyphs.extend_from_slice(cluster.glyphs);
+        });
+    }
+
     let baseline = 56.0_f32;
     let margin = 16.0_f32;
-    let mut pen_x = margin;
-    let mut pen_y = 0.0_f32;
-    let mut glyphs = Vec::with_capacity(infos.len());
-    let mut missing_glyphs = 0;
+    let mut pen_x = 0.0_f32;
     let mut rightmost = margin;
+    let mut scale_context = ScaleContext::new();
+    let mut scaler = scale_context
+        .builder(font)
+        .size(pixel_size)
+        .hint(false)
+        .build();
+    let renderer = Render::new(&[Source::Outline]);
+    let mut rendered_glyphs = Vec::with_capacity(shaped_glyphs.len());
 
-    for (info, position) in infos.iter().zip(positions.iter()) {
-        let glyph_id = info.glyph_id as u16;
-        if glyph_id == 0 {
-            missing_glyphs += 1;
+    for glyph in &shaped_glyphs {
+        let x = pen_x + glyph.x;
+        let y = baseline - glyph.y;
+        if let Some(image) = renderer.render(&mut scaler, glyph.id) {
+            let left = (margin + x + image.placement.left as f32).floor() as i32;
+            let top = (y - image.placement.top as f32).floor() as i32;
+            rightmost = rightmost.max((left + image.placement.width as i32) as f32);
+            rendered_glyphs.push((left, top, image));
         }
-        let (metrics, bitmap) = font.rasterize_indexed(glyph_id, pixel_size);
-        let offset_x = position.x_offset as f32 * scale;
-        let offset_y = position.y_offset as f32 * scale;
-        let origin_x = pen_x + offset_x;
-        let glyph_baseline = baseline - pen_y - offset_y;
-        let left = origin_x.floor() as i32 + metrics.xmin;
-        let top = (glyph_baseline - metrics.ymin as f32 - metrics.height as f32).floor() as i32;
-        rightmost = rightmost.max((left + metrics.width as i32) as f32);
-        glyphs.push((left, top, metrics, bitmap));
-        pen_x += position.x_advance as f32 * scale;
-        pen_y += position.y_advance as f32 * scale;
+        pen_x += glyph.advance;
     }
 
     let width = (rightmost.ceil() as u32 + margin as u32).max(1);
@@ -68,10 +105,15 @@ pub fn shape_and_rasterize(
     let mut rgba = vec![255_u8; (width * height * 4) as usize];
     let mut nonzero_coverage_pixels = 0;
 
-    for (left, top, metrics, bitmap) in glyphs {
-        for glyph_y in 0..metrics.height {
-            for glyph_x in 0..metrics.width {
-                let coverage = bitmap[glyph_y * metrics.width + glyph_x];
+    for (left, top, image) in rendered_glyphs {
+        let glyph_width = image.placement.width as usize;
+        let glyph_height = image.placement.height as usize;
+        if image.data.len() < glyph_width.saturating_mul(glyph_height) {
+            return Err("Swash returned a truncated alpha glyph bitmap".into());
+        }
+        for glyph_y in 0..glyph_height {
+            for glyph_x in 0..glyph_width {
+                let coverage = image.data[glyph_y * glyph_width + glyph_x];
                 if coverage == 0 {
                     continue;
                 }
@@ -96,7 +138,7 @@ pub fn shape_and_rasterize(
         height,
         rgba,
         input_codepoints: text.chars().count(),
-        shaped_glyphs: infos.len(),
+        shaped_glyphs: shaped_glyphs.len(),
         missing_glyphs,
         nonzero_coverage_pixels,
     })
@@ -120,12 +162,26 @@ mod tests {
         assert!(result.shaped_glyphs > 0);
         assert_eq!(result.missing_glyphs, 0);
         assert!(result.nonzero_coverage_pixels > 0);
+        assert!(
+            result
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] < 255)
+        );
         assert!(result.width > 100);
     }
 
     #[test]
     fn rejects_invalid_font_size_before_parsing_font_data() {
         assert!(shape_and_rasterize(&[], "AIBE", 0.0).is_err());
+        assert!(shape_and_rasterize(&[], "AIBE", f32::NAN).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_font_data() {
+        assert!(shape_and_rasterize(b"not a font", "AIBE", 16.0).is_err());
     }
 
     #[test]

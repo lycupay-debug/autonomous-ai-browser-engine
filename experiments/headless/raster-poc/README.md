@@ -1,6 +1,6 @@
 # Headless text shaping, raster and image decode PoC
 
-A pure-Rust prototype uses `rustybuzz 0.20.1` to shape Unicode text with OpenType tables, `fontdue 0.9.5` to rasterize the resulting glyph IDs, and `png 0.18.1` to encode an RGBA surface. The PNG is then decoded with `image 0.25.10`.
+A pure-Rust prototype uses `swash 0.2.10` for Unicode-script shaping, OpenType font parsing, outline scaling, and glyph rasterization; `png 0.18.1` encodes an RGBA surface, which is then decoded with `image 0.25.10`. This replaces the unmaintained `rustybuzz` and `ttf-parser` stack and removes `fontdue` from the prototype.
 
 Unit tests exercise mixed Latin/Simplified Chinese shaping, missing-glyph detection, invalid font sizes, and PNG/JPEG/GIF/WebP encode/decode roundtrips. The tested Noto Sans SC variable font and its OFL notice remain under `/tmp/aibe-fonts` and are not committed.
 
