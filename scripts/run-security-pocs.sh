@@ -33,3 +33,5 @@ printf '%s\n' '=== Renderer crash recovery ==='
 "$OUT_DIR/renderer-supervisor"
 printf '%s\n' '=== Jail network isolation ==='
 "$REPO_DIR/scripts/run-jail-network-poc.sh"
+printf '%s\n' '=== Single Renderer Jail lifecycle / identity / RCTL ==='
+"$REPO_DIR/scripts/run-renderer-jail-lifecycle-poc.sh"
