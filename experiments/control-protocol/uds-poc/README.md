@@ -1,8 +1,17 @@
 # Native AI Control Protocol / UDS PoC
 
-A newline-delimited JSON envelope with `protocol_version`, `request_id`, `method`, and `params` is exercised over a Unix Domain Socket. The socket path is set to mode `0600`. Contract tests cover health, version rejection, request-ID preservation, task creation, task lookup, queued cancellation, running cancellation requests, and terminal task-state preservation.
+A newline-delimited JSON envelope with `protocol_version`, `request_id`, `method`, and `params` is exercised over a Unix Domain Socket. The socket path is set to mode `0600`. On FreeBSD, the test server accepts peers through kernel-authenticated `getpeereid()` UID authorization; non-FreeBSD builds return `Unsupported` rather than trusting request-supplied identity.
 
-This is not a production broker. It does not authenticate peer UID/GID, use Capsicum, implement request deadlines or cancellation tokens, execute browser work, enforce capabilities, or protect against malformed/oversized input. The test-only server logic is intentionally not exposed as a deployable service.
+The protocol boundary now enforces:
+- 64 KiB maximum request and response frames, including the newline delimiter.
+- Bounded request serialization on the client, bounded incremental reads on both sides, and mandatory newline termination.
+- Five-second stream read/write timeouts on client and server.
+- JSON object top-level validation; bounded non-empty string/number request IDs; bounded method and task identifiers.
+- Invalid JSON, malformed request shapes, oversized frames, truncated frames, and oversized broker responses are rejected.
+- Socket write failure after client disconnect is returned as an I/O error rather than panicking the handler.
+- The bind helper refuses to unlink or replace an existing filesystem entry.
+
+This remains a test-only protocol/state-machine PoC, not a production broker. It does not yet use Capsicum in the Rust protocol process, execute browser work, enforce the complete capability policy, implement durable task state, replay/idempotency handling, cancellation tokens, or concurrent request scheduling. Kernel peer-credential authentication is exercised in the FreeBSD test server and is not yet connected to a production authorization policy.
 
 Run:
 

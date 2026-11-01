@@ -53,7 +53,7 @@ clang -Wall -Wextra -Werror -O2 experiments/security/capsicum-minimal/src/main.c
 ./scripts/run-network-poc.sh
 ```
 
-The Test262 runners execute a pinned, deliberately limited synchronous subset across Boa, V8 and SpiderMonkey; they are not full Test262 conformance. The V8/SpiderMonkey scripts require FreeBSD runtime packages extracted under `/tmp` as documented in `docs/phase-0/js-runtime-comparison.md`. Security experiments are narrow primitives, not a complete renderer sandbox. The network probe follows only bounded HTTPS response headers with socket timeouts and is not a complete Fetch implementation. The headless PoC exercises one shaped text run and common image formats, not CSS layout or a full rendering engine. Five Cargo-only CycloneDX 1.5 SBOMs are stored under `sbom/`; native system packages and assets are outside their scope.
+The Test262 runners execute a pinned, deliberately limited synchronous subset across Boa, V8 and SpiderMonkey; they are not full Test262 conformance. The V8/SpiderMonkey scripts require FreeBSD runtime packages extracted under `/tmp` as documented in `docs/phase-0/js-runtime-comparison.md`. Security experiments are narrow primitives, not a complete renderer sandbox. The network probe follows only bounded HTTPS response headers with socket timeouts and is not a complete Fetch implementation. The headless PoC exercises one shaped text run and common image formats, not CSS layout or a full rendering engine. Seven Cargo-only CycloneDX 1.5 SBOMs are stored under `sbom/`; native system packages and assets are outside their scope.
 
 ## Decisions and licensing
 

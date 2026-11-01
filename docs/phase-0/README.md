@@ -320,3 +320,29 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - It does not yet model Document, Frame, Worker, Agent Cluster, browsing context groups, opener relationships, sandbox flags, process/site isolation, or navigation commit/rollback.
 - Origin mapping is retained only while at least one Realm in the group is active. Persistent storage partitioning and browsing-session lifetime are separate concerns.
 - The V8 integration test proves URL-origin mapping and Context lifecycle; cross-origin native wrapper access is covered by the FFI crate's dedicated probe, not by a general DOM or Same-Origin Policy implementation.
+
+
+## UDS control-protocol framing and client hardening — 2026-11-01
+
+### Implementation
+- Added shared bounded newline-frame reading for both broker-side request handling and client-side response handling.
+- Both directions enforce a 64 KiB maximum frame size, including the newline delimiter; missing newline termination is rejected as a truncated frame.
+- Client request serialization now uses a bounded writer, preventing an extra unbounded serialized copy of a caller-supplied JSON value.
+- Client and server set five-second stream read/write timeouts.
+- Client validates that the broker response is a JSON object and rejects oversized or truncated responses.
+- Requests must be JSON objects. Request IDs, method names, and task IDs have explicit 256-byte limits; invalid request IDs are not echoed into error responses.
+- Server response write errors are propagated instead of panicking if the client disconnects.
+- Existing FreeBSD getpeereid authorized-accept path remains in place for the test server.
+
+### Verification
+- UDS protocol tests: 16/16 passed on FreeBSD 15.1-RELEASE-p6.
+- New negative tests cover exact frame-size boundary, one-byte-over limit, oversized outbound request before connect, oversized inbound broker response, truncated response, invalid top-level JSON shape, oversized request ID, and client disconnect during response write.
+- UDS crate Clippy with -D warnings: passed.
+- Full FreeBSD workspace: 87/87 tests passed (Boa 7, Browser Runtime 7, UDS 16, Headless 4, V8 FFI 21, Network 17, Origin Policy 15).
+- cargo fmt --all -- --check, workspace Clippy with -D warnings, and git diff --check: passed.
+
+### Limits
+- This remains a protocol PoC; no production Broker service or renderer task execution has been enabled.
+- Peer UID authentication is available through a FreeBSD kernel helper and used by the test server, but the full authorization/capability policy is not yet integrated.
+- No request replay/idempotency store, per-peer quotas, concurrent scheduling, cancellation token, durable task journal, or production broker crash recovery exists.
+- The five-second timeout is a local stream I/O deadline, not a full end-to-end task deadline.
