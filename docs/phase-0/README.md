@@ -432,3 +432,28 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Dedicated Worker ownership tests cover same-origin Realm separation, cross-origin rejection without Realm leaks, termination retry, Document replacement, and recursive Frame detach.
 
 **Scope limits:** this is an ownership/lifetime model only. It does not fetch or validate redirected Worker scripts, create `WorkerGlobalScope`, implement Worker event loops, `postMessage`/structured clone, CSP/referrer policy, module/classic script semantics, SharedWorker, or ServiceWorker.
+
+## Incremental R&D record｜2026-11-01（Parent Document replacement and descendant Frame teardown）
+
+### Finding and implementation
+
+- Review of the Navigation / Document / Frame ownership model found a lifecycle gap: committing a replacement Document removed the outgoing Document and its Dedicated Workers, but did not detach descendant Frame subtrees owned by that outgoing Document.
+- `commit_navigation()` now tears down descendant Frame subtrees in stable Frame ID order before terminating the outgoing Document's Workers and Realm.
+- Teardown remains retryable: if a descendant Worker/Realm destruction fails, the parent Document remains current and the Navigation remains pending. Already detached descendants stay detached; remaining descendants can be cleaned on retry.
+- This is a bounded lifecycle-model correction. It does not claim full HTML navigable, iframe element, unload/pagehide, or WHATWG navigation semantics.
+
+### Verification
+
+- Browser Runtime: 23/23 tests passed, including nested descendant Frame/Worker cleanup and injected descendant Worker teardown failure followed by successful retry.
+- FreeBSD workspace: 117/117 tests passed with `AIBE_RUNTIME_PREFIX` unset and `LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib`.
+- `cargo fmt --all -- --check`: passed.
+- Workspace Clippy with `-D warnings`: passed.
+- Full `scripts/run-security-pocs.sh`: passed, including Capsicum FD rights, Broker/Renderer boundary, UDS peer credentials, per-Origin storage grants, malformed SCM_RIGHTS cleanup, Renderer crash recovery, and Jail IPv4 isolation.
+- SBOM validator: all eight crate BOM fixtures passed, including the zero-dependency Broker policy crate; Python and shell syntax checks passed.
+- `git diff --check`: passed.
+
+### Limits
+
+- Frame/Document/Worker ownership is still a deterministic host-side model. There is no actual iframe DOM integration, parser-driven browsing-context creation, page lifecycle event dispatch, real Network Loader, or browser task/event loop.
+- Failure recovery is tested with an injected Runtime teardown error; this does not prove recovery from arbitrary native V8 process crashes.
+- No production service, persistent FreeBSD configuration, sysctl, or host service state was changed.

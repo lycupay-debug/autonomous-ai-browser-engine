@@ -463,6 +463,12 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         }
         let old_document_id = frame.current_document;
         let document_id = self.allocate_document_id()?;
+        if old_document_id.is_some() {
+            // Child browsing contexts belong to the outgoing Document tree.
+            // Tear them down before replacing the parent Document so no child
+            // Frame or Worker remains attached to a document that no longer exists.
+            self.detach_child_frames(candidate.frame)?;
+        }
         if let Some(old_document_id) = old_document_id {
             self.terminate_document_workers(old_document_id)?;
             let old_document = self
@@ -509,6 +515,25 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             frame.pending_navigation = None;
         }
         Ok(())
+    }
+
+    /// Detaches all child Frame subtrees in stable ID order. A failure leaves
+    /// the remaining children attached so the owning navigation can be retried.
+    fn detach_child_frames(&mut self, frame: FrameId) -> Result<usize, NavigationError<R::Error>> {
+        let mut children = self
+            .frames
+            .get(&frame)
+            .ok_or(NavigationError::UnknownFrame)?
+            .children
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.0);
+        let mut detached = 0;
+        for child in children {
+            detached += self.detach_frame(child)?;
+        }
+        Ok(detached)
     }
 
     /// Detaches a Frame subtree in post-order. If Runtime destruction fails,

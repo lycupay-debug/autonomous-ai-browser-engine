@@ -449,6 +449,93 @@ mod tests {
     }
 
     #[test]
+    fn parent_document_commit_detaches_descendant_frames_and_workers() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let child = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Inherited)
+            .unwrap();
+        let grandchild = controller
+            .create_child_frame(child, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let old_document = controller.current_document_id(root).unwrap();
+        let child_document = controller.current_document_id(child).unwrap();
+        let grandchild_document = controller.current_document_id(grandchild).unwrap();
+        let child_worker = controller
+            .create_dedicated_worker(child_document, "https://a.example/child.js")
+            .unwrap();
+        let grandchild_worker = controller
+            .create_dedicated_worker(grandchild_document, "https://b.example/grandchild.js")
+            .unwrap();
+        let navigation = controller
+            .begin_navigation(root, "https://c.example/new", NavigationMode::Url)
+            .unwrap();
+
+        let new_document = controller.commit_navigation(navigation).unwrap();
+
+        assert_ne!(new_document, old_document);
+        assert!(controller.document(old_document).is_none());
+        assert!(controller.document(child_document).is_none());
+        assert!(controller.document(grandchild_document).is_none());
+        assert!(controller.worker(child_worker).is_none());
+        assert!(controller.worker(grandchild_worker).is_none());
+        assert!(controller.frame_children(root).unwrap().is_empty());
+        assert!(controller.frame_parent(child).is_none());
+        assert!(controller.frame_parent(grandchild).is_none());
+        assert_eq!(controller.active_frame_count(), 1);
+        assert_eq!(controller.active_document_count(), 1);
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn descendant_teardown_failure_keeps_parent_navigation_retryable() {
+        use super::navigation::{NavigationController, NavigationMode, WorkerState};
+        let runtime = MockRuntime {
+            // Root, child, and grandchild Realms are allocated first; the
+            // grandchild Worker Realm is therefore the fourth Runtime Realm.
+            fail_destroy_realm_once: Some(4),
+            ..MockRuntime::default()
+        };
+        let mut controller = NavigationController::new(runtime).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let child = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Inherited)
+            .unwrap();
+        let grandchild = controller
+            .create_child_frame(child, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let old_document = controller.current_document_id(root).unwrap();
+        let grandchild_document = controller.current_document_id(grandchild).unwrap();
+        let worker = controller
+            .create_dedicated_worker(grandchild_document, "https://b.example/worker.js")
+            .unwrap();
+        let navigation = controller
+            .begin_navigation(root, "https://c.example/new", NavigationMode::Url)
+            .unwrap();
+
+        assert!(controller.commit_navigation(navigation).is_err());
+        assert_eq!(controller.current_document_id(root), Some(old_document));
+        assert!(controller.document(old_document).is_some());
+        assert!(controller.frame_parent(grandchild).is_some());
+        assert_eq!(
+            controller.worker(worker).unwrap().state(),
+            WorkerState::Terminating
+        );
+        assert_eq!(controller.pending_navigation_count(), 1);
+
+        let committed = controller.commit_navigation(navigation).unwrap();
+        assert_ne!(committed, old_document);
+        assert!(controller.frame_parent(child).is_none());
+        assert!(controller.frame_parent(grandchild).is_none());
+        assert!(controller.worker(worker).is_none());
+        assert_eq!(controller.active_frame_count(), 1);
+        assert_eq!(controller.active_document_count(), 1);
+        assert_eq!(controller.active_worker_count(), 0);
+    }
+
+    #[test]
     fn abort_preserves_current_document_and_releases_candidate_realm() {
         use super::navigation::{NavigationController, NavigationMode};
         let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
