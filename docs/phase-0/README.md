@@ -579,3 +579,12 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Added regression coverage for a valid handle, cross-Document rejection, and stale-handle rejection after a reparse that deliberately reuses the same NodeId index.
 - Browser Runtime: 39/39 passed; full workspace after this addition: 156/156 passed; Rustfmt, Clippy (`-D warnings`), diff check and Security PoC suite passed.
 - This validates host-side handle scoping only. No remote Renderer has yet parsed or enforced the envelope, and no UDS transfer or live V8 DOM wrapper mapping is claimed.
+
+## 2026-11-01 UDS DOM Snapshot binary frame codec
+
+- Added a separate DOM Snapshot frame codec to the UDS control-protocol PoC. Existing newline-delimited control RPC remains capped at 64 KiB; DOM Snapshot uses a dedicated 20-byte big-endian header (`AIBS` magic, transport version, message type, nonzero request ID, payload length) and a maximum 8 MiB payload.
+- Payload validation requires envelope version 1, decimal-string nonzero Document ID/revision, tree schema version 1, a bounded node count, unique parser-local node IDs, valid root Document, known parent/child/template references, reciprocal parent/child edges, and an acyclic parent graph.
+- Decoder checks the declared payload length before allocating the payload buffer; malformed, truncated, unsupported-version/type, zero-length, oversized and structurally inconsistent frames are rejected.
+- Added a UnixStream socket-pair round-trip and negative tests. UDS crate: 27/27 tests passed; workspace: 166/166 passed; Rustfmt, Clippy (`-D warnings`), diff check and full Security PoC suite passed.
+- The codec is deliberately not wired into the existing authenticated server path. It does not authenticate peers, authorize Document/Origin/Renderer grants, or transfer SCM_RIGHTS descriptors. Callers must enforce FreeBSD getpeereid identity, Renderer instance and Origin grant before accepting the payload; callers must also set finite socket read/write timeouts.
+- This is a bounded framing and schema-validation PoC, not cross-process Broker/Renderer integration or production IPC. No service or persistent host configuration was changed.
