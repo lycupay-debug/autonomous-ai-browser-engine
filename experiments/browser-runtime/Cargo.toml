@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 aibe-js-runtime-ffi-poc = { path = "../js-runtime/ffi-poc" }
 aibe-origin-policy-poc = { path = "../origin-policy" }
+aibe-html-parser-poc = { path = "../html-parser" }

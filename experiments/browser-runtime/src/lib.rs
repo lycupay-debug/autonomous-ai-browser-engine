@@ -676,6 +676,89 @@ mod tests {
     }
 
     #[test]
+    fn current_document_owns_the_parsed_html_tree() {
+        use super::navigation::NavigationController;
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        controller
+            .parse_document_html(
+                document,
+                b"<!doctype html><title>Owned</title><main><p id='status'>ready</p></main>",
+            )
+            .unwrap();
+        let html = controller
+            .document(document)
+            .unwrap()
+            .html_document()
+            .unwrap();
+        let title = html.find_first_element_by_tag_name("title").unwrap();
+        let status = html.find_element_by_id("status").unwrap();
+        assert_eq!(html.text_content(title).as_deref(), Some("Owned"));
+        assert_eq!(html.text_content(status).as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn failed_html_parse_preserves_the_current_document_tree() {
+        use super::navigation::{NavigationController, NavigationError};
+        use aibe_html_parser_poc::{HtmlParseError, MAX_HTML_INPUT_BYTES};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        controller
+            .parse_document_html(document, b"<p>stable</p>")
+            .unwrap();
+        let oversized = vec![b'x'; MAX_HTML_INPUT_BYTES + 1];
+        assert!(matches!(
+            controller.parse_document_html(document, &oversized),
+            Err(NavigationError::HtmlParse(
+                HtmlParseError::InputTooLarge { .. }
+            ))
+        ));
+        let html = controller
+            .document(document)
+            .unwrap()
+            .html_document()
+            .unwrap();
+        let paragraph = html.find_first_element_by_tag_name("p").unwrap();
+        assert_eq!(html.text_content(paragraph).as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn navigation_parse_failure_does_not_commit_or_destroy_the_current_document() {
+        use super::navigation::{NavigationController, NavigationError, NavigationMode};
+        use aibe_html_parser_poc::{HtmlParseError, MAX_HTML_INPUT_BYTES};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let oversized = vec![b'x'; MAX_HTML_INPUT_BYTES + 1];
+        assert!(matches!(
+            controller.commit_navigation_with_html(navigation, &oversized),
+            Err(NavigationError::HtmlParse(
+                HtmlParseError::InputTooLarge { .. }
+            ))
+        ));
+        assert_eq!(controller.current_document_id(frame), Some(original));
+        assert_eq!(controller.pending_navigation_count(), 1);
+
+        let committed = controller
+            .commit_navigation_with_html(navigation, b"<!doctype html><title>new</title>")
+            .unwrap();
+        assert_ne!(committed, original);
+        assert!(controller.document(original).is_none());
+        let html = controller
+            .document(committed)
+            .unwrap()
+            .html_document()
+            .unwrap();
+        let title = html.find_first_element_by_tag_name("title").unwrap();
+        assert_eq!(html.text_content(title).as_deref(), Some("new"));
+    }
+
+    #[test]
     fn root_navigation_commit_replaces_document_only_at_commit() {
         use super::navigation::{NavigationController, NavigationMode};
         let mut controller = NavigationController::new(MockRuntime::default()).unwrap();

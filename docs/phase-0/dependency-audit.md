@@ -17,6 +17,7 @@ Snapshot environment: FreeBSD 15.1-RELEASE-p6 amd64; Cargo.lock committed with t
 | `rustls-pki-types` | 1.15.1 | Apache-2.0 OR ISC OR MIT |
 | `url` | 2.5.8 | MIT OR Apache-2.0 |
 | `image` | 0.25.10 | MIT OR Apache-2.0 |
+| `html5ever` | 0.40.1 | MIT OR Apache-2.0 |
 
 ## Cargo metadata scan
 
@@ -66,10 +67,11 @@ Do not choose or publish a project license until the owner explicitly approves i
 
 ## Current Cargo and supply-chain status — 2026-11-01
 
-- Current locked workspace metadata: 211 packages total, comprising eight project-owned workspace crates and 203 third-party packages.
-- All 203 third-party packages declare license metadata in Cargo metadata. This does not constitute legal approval. The eight project-owned PoC crates intentionally have no selected project license; `docs/phase-0/LICENSING_DECISION.md` remains pending.
-- The SBOM generator and validator now expect eight CycloneDX 1.5 documents: Boa host, Broker policy, Browser Runtime, UDS control protocol, Headless raster, JS Runtime FFI, Network policy, and Origin policy.
-- GitHub Actions Run `41288165444` completed successfully for commit `e4421a17cbf4afd9c40cc3287961ff5c9be14335`: Rust formatting, workspace tests and Clippy passed; `cargo-audit` 0.22.2 passed; `cargo-cyclonedx` 0.5.9 generated all eight per-crate SBOMs and the validator passed. Both workflow jobs completed successfully for this commit.
-- The checked-in `sbom/` directory currently contains five historical files from an earlier dependency graph. CI regenerates all eight files and uploads them as a workflow artifact; the five tracked files are not a current complete SBOM set.
+- Current locked workspace metadata after adding the HTML Parser PoC: 223 packages total, comprising nine project-owned workspace crates and 214 third-party packages.
+- All 214 third-party packages declare license metadata in Cargo metadata. This does not constitute legal approval. The nine project-owned PoC crates intentionally have no selected project license; `docs/phase-0/LICENSING_DECISION.md` remains pending.
+- Added direct dependency `html5ever` 0.40.1 (MIT OR Apache-2.0); its parser/tree-builder dependencies are included in Cargo.lock and Cargo SBOM scope.
+- The SBOM generator and validator now expect nine CycloneDX 1.5 documents: Boa host, Broker policy, Browser Runtime, HTML Parser, UDS control protocol, Headless raster, JS Runtime FFI, Network policy, and Origin policy.
+- The latest verified CI run (Run `41288165444`) predates the HTML Parser dependency and does not validate this lockfile. A new CI cargo-audit/SBOM run for the HTML Parser commit is required before claiming the updated dependency graph is clean.
+- The checked-in `sbom/` directory currently contains five historical files from an earlier dependency graph. CI regenerates the complete nine-file set and uploads it as a workflow artifact; the five tracked files are not a current complete SBOM set.
 - Cargo SBOM coverage excludes native FreeBSD packages (V8, SpiderMonkey), base-system libraries, extracted SDK assets, fonts, and the complete host package closure. Those require a separate host/runtime bill of materials.
 - No project-wide license has been selected. License metadata completeness is not permission to redistribute the repository or its assets.

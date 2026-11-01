@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use aibe_html_parser_poc::{HtmlDocument, HtmlParseError, parse_html};
 use aibe_js_runtime_ffi_poc::{JsRealmId, JsRuntime, JsRuntimeError, JsValue};
 use aibe_origin_policy_poc::OriginGroupId;
 
@@ -68,6 +69,7 @@ pub enum NavigationError<E> {
         initialization: BrowserRuntimeOriginError<E>,
         cleanup: BrowserRuntimeOriginError<E>,
     },
+    HtmlParse(HtmlParseError),
     UnknownFrame,
     UnknownDocument,
     UnknownNavigation,
@@ -92,6 +94,7 @@ impl<E: fmt::Display> fmt::Display for NavigationError<E> {
                 formatter,
                 "Document initialization failed ({initialization}); candidate Realm cleanup also failed ({cleanup})"
             ),
+            Self::HtmlParse(error) => write!(formatter, "HTML parsing failed: {error}"),
             Self::UnknownFrame => formatter.write_str("unknown Frame"),
             Self::UnknownDocument => formatter.write_str("unknown Document"),
             Self::UnknownNavigation => formatter.write_str("unknown Navigation"),
@@ -122,12 +125,19 @@ impl<E> From<BrowserRuntimeOriginError<E>> for NavigationError<E> {
     }
 }
 
+impl<E> From<HtmlParseError> for NavigationError<E> {
+    fn from(error: HtmlParseError) -> Self {
+        Self::HtmlParse(error)
+    }
+}
+
 pub struct Document<R: OriginRealmRuntime> {
     id: DocumentId,
     frame: FrameId,
     url: String,
     origin: OriginGroupId,
     realm: R::Realm,
+    html_document: Option<HtmlDocument>,
 }
 
 impl<R: OriginRealmRuntime> Document<R> {
@@ -145,6 +155,9 @@ impl<R: OriginRealmRuntime> Document<R> {
     }
     pub const fn realm(&self) -> R::Realm {
         self.realm
+    }
+    pub fn html_document(&self) -> Option<&HtmlDocument> {
+        self.html_document.as_ref()
     }
 }
 
@@ -307,6 +320,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
                 url: url.to_owned(),
                 origin,
                 realm,
+                html_document: None,
             },
         );
         Ok(frame)
@@ -366,6 +380,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
                 url: url.to_owned(),
                 origin,
                 realm,
+                html_document: None,
             },
         );
         Ok(frame)
@@ -438,6 +453,41 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             .expect("validated frame remains present")
             .pending_navigation = Some(id);
         Ok(id)
+    }
+
+    /// Parses bounded UTF-8 HTML into the current Document-owned tree.
+    /// A parse failure leaves any previously attached tree unchanged.
+    pub fn parse_document_html(
+        &mut self,
+        document: DocumentId,
+        body: &[u8],
+    ) -> Result<(), NavigationError<R::Error>> {
+        if !self.documents.contains_key(&document) {
+            return Err(NavigationError::UnknownDocument);
+        }
+        let parsed = parse_html(body)?;
+        self.documents
+            .get_mut(&document)
+            .expect("validated Document remains present")
+            .html_document = Some(parsed);
+        Ok(())
+    }
+
+    /// Parses a candidate response before performing any destructive commit
+    /// work. If parsing fails, the current Document and pending Navigation remain
+    /// unchanged and the caller may retry with another body or abort.
+    pub fn commit_navigation_with_html(
+        &mut self,
+        navigation: NavigationId,
+        body: &[u8],
+    ) -> Result<DocumentId, NavigationError<R::Error>> {
+        let parsed = parse_html(body)?;
+        let document = self.commit_navigation(navigation)?;
+        self.documents
+            .get_mut(&document)
+            .expect("committed Document remains present")
+            .html_document = Some(parsed);
+        Ok(document)
     }
 
     pub fn redirect(
@@ -522,6 +572,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
                 url: candidate.target_url,
                 origin: candidate.target_origin,
                 realm: candidate.target_realm,
+                html_document: None,
             },
         );
         let frame = self

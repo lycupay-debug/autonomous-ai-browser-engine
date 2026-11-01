@@ -520,3 +520,34 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - No HTML parsing, HTML-to-DOM construction, Window/Location/History, lifecycle event dispatch, CSS, layout, form controls, MutationObserver, HTML Event Loop, or browser task scheduling is implemented.
 - `evaluate_document_value` is a Phase 0 host-side entry point, not the final AI Control protocol or a production script-execution security model.
 - No production service, persistent FreeBSD configuration, sysctl, or host service state was changed.
+
+## Incremental R&D record｜2026-11-01（HTML5 parser, bounded DOM tree and Document ownership）
+
+### Implementation
+
+- Added workspace crate `aibe-html-parser-poc`, using `html5ever` 0.40.1 for tokenization and HTML5 tree construction, with a project-owned index-based `TreeSink`/node arena. `markup5ever_rcdom` is not used.
+- Implemented Document, DocumentFragment, Doctype, Element, Text, Comment and ProcessingInstruction records; HTML, SVG and MathML namespaces; template contents; duplicate-attribute handling; quirks mode; basic tag/local-name/id/attribute/text queries.
+- Added resource bounds: input <= 1 MiB, DOM nodes <= 65,536 (including Document root), recorded parse errors <= 256. Node-budget exhaustion returns a typed error; it does not expose a truncated tree as a successful parse.
+- Input currently assumes UTF-8; `from_utf8()` decoding is lossy. No encoding sniffing, streaming parser, `document.write`, script execution, parser-blocking script lifecycle or WPT/html5lib conformance claim.
+- Integrated parser ownership into `NavigationController::Document`: `parse_document_html()` attaches a tree to a live Document; `commit_navigation_with_html()` parses before destructive navigation commit, so parse failure leaves the old Document and pending navigation unchanged.
+- Added `--body-stdout` to the bounded HTTPS fetch PoC and `aibe-html-parser-poc` stdin CLI. `scripts/run-html-pipeline-poc.sh` fetches in one process, writes the bounded body to a temporary file, then parses it in a separate process; the temporary file is removed on exit.
+- Live pipeline result: `https://example.com/` returned HTTP 200, 577 response bytes; parser produced 16 DOM nodes, title `Example Domain`, `NoQuirks`, and zero parse errors.
+
+### Verification
+
+- HTML Parser: 9/9 tests passed, covering implied document structure, malformed paragraph repair, entities, raw-text handling, SVG/MathML namespaces, template contents, duplicate attributes, and input/node/error limits.
+- Browser Runtime: 37/37 tests passed, including Document-owned tree attachment and parse-before-commit failure safety.
+- Full FreeBSD workspace: 153/153 tests passed.
+- Workspace Clippy `-D warnings`, Rustfmt, `git diff --check`, complete Security PoC suite, Python/shell syntax checks and all nine synthetic SBOM fixtures passed.
+- Cargo metadata: 223 packages total, nine workspace crates, 214 third-party packages; all 214 third-party packages declare license metadata. This is metadata presence, not legal approval.
+
+### Integration risk discovered
+
+- An exploratory same-process test linking Network Policy and Browser Runtime/JS runtime libraries stopped with SIGBUS in FreeBSD libc `getaddrinfo` (`comp_dst`) before V8 initialization. The Network Policy CLI succeeds independently, and the process-separated fetch-to-parser script succeeds. The exact cause is not established; the direct Network Policy dependency was removed from Browser Runtime. Keep the process boundary and investigate the native-linking/resolver interaction before attempting same-process integration again.
+- The temporary-file handoff is a test harness only, not the final authenticated UDS Network Service protocol. Parsed Rust HTML nodes are not yet the same objects as V8 native Node wrappers.
+
+### Remaining limits
+
+- No HTML Parser → V8 Node wrapper bridge, stable node IDs, DOM mutation/events, Window/Web IDL, forms, CSS, Layout, Paint, accessibility tree or AI evidence snapshot.
+- No production Network Service/IPC integration, streaming/cancellation, cache/cookies/compression, HTTP/2/3 or non-UTF-8 encoding support.
+- `html5ever` provides parser algorithms, but project compatibility still requires pinned html5lib/WPT tests, fuzzing, hostile-input testing and resource profiling.

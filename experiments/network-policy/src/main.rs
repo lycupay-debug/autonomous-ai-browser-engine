@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 use aibe_network_policy_poc::{FetchHeadersResult, fetch_https_get, fetch_https_headers};
@@ -18,11 +19,12 @@ fn print_metadata(result: &FetchHeadersResult) {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(url) = args.next() else {
-        eprintln!("usage: aibe-network-policy-poc <https-url> [ca-bundle] [--body]");
+        eprintln!("usage: aibe-network-policy-poc <https-url> [ca-bundle] [--body|--body-stdout]");
         std::process::exit(2);
     };
     let remaining = args.collect::<Vec<_>>();
-    let body_mode = remaining.iter().any(|argument| argument == "--body");
+    let body_stdout = remaining.iter().any(|argument| argument == "--body-stdout");
+    let body_mode = body_stdout || remaining.iter().any(|argument| argument == "--body");
     let ca_bundle = remaining
         .iter()
         .find(|argument| argument.as_str() != "--body")
@@ -32,16 +34,30 @@ fn main() {
     if body_mode {
         match fetch_https_get(&url, Path::new(ca_bundle), 5, 8 * 1024 * 1024) {
             Ok(result) => {
-                print_metadata(&result.metadata);
-                println!("body_bytes={}", result.body.len());
-                let preview = result
-                    .body
-                    .iter()
-                    .take(32)
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<Vec<_>>()
-                    .join("");
-                println!("body_prefix_hex={preview}");
+                if body_stdout {
+                    eprintln!(
+                        "status={} final_url={} connected_peer={} redirects={} body_bytes={}",
+                        result.metadata.status,
+                        result.metadata.final_url,
+                        result.metadata.connected_peer,
+                        result.metadata.redirect_chain.len(),
+                        result.body.len()
+                    );
+                    std::io::stdout()
+                        .write_all(&result.body)
+                        .expect("write fetched response body to stdout");
+                } else {
+                    print_metadata(&result.metadata);
+                    println!("body_bytes={}", result.body.len());
+                    let preview = result
+                        .body
+                        .iter()
+                        .take(32)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    println!("body_prefix_hex={preview}");
+                }
             }
             Err(error) => {
                 eprintln!("request denied/failed: {error}");
