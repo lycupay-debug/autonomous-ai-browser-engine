@@ -579,6 +579,110 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_worker_uses_a_separate_realm_in_the_document_origin_group() {
+        use super::navigation::{NavigationController, WorkerState};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        let document_realm = controller.document(document).unwrap().realm();
+        let worker = controller
+            .create_dedicated_worker(document, "https://a.example/worker.js")
+            .unwrap();
+        let worker_record = controller.worker(worker).unwrap();
+        assert_eq!(worker_record.state(), WorkerState::Running);
+        assert_eq!(worker_record.owner_document(), document);
+        assert_eq!(
+            worker_record.origin(),
+            controller.document(document).unwrap().origin()
+        );
+        assert_ne!(worker_record.realm(), document_realm);
+        assert_eq!(controller.active_worker_count(), 1);
+        assert_eq!(controller.workers_for_document(document), vec![worker]);
+        controller.terminate_worker(worker).unwrap();
+        assert_eq!(controller.active_worker_count(), 0);
+        assert!(controller.terminate_worker(worker).is_err());
+    }
+
+    #[test]
+    fn cross_origin_dedicated_worker_script_is_rejected_without_leaking_a_realm() {
+        use super::navigation::{NavigationController, NavigationError};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        assert!(matches!(
+            controller.create_dedicated_worker(document, "https://b.example/worker.js"),
+            Err(NavigationError::CrossOriginWorkerScript)
+        ));
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn document_commit_terminates_workers_owned_by_the_replaced_document() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let old_document = controller.current_document_id(frame).unwrap();
+        let worker = controller
+            .create_dedicated_worker(old_document, "https://a.example/worker.js")
+            .unwrap();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let new_document = controller.commit_navigation(navigation).unwrap();
+        assert_ne!(new_document, old_document);
+        assert!(controller.document(old_document).is_none());
+        assert!(controller.worker(worker).is_none());
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn worker_termination_failure_keeps_a_retryable_terminating_record() {
+        use super::navigation::{NavigationController, WorkerState};
+        let runtime = MockRuntime {
+            fail_destroy_realm_once: Some(2),
+            ..MockRuntime::default()
+        };
+        let mut controller = NavigationController::new(runtime).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        let worker = controller
+            .create_dedicated_worker(document, "https://a.example/worker.js")
+            .unwrap();
+        assert!(controller.terminate_worker(worker).is_err());
+        assert_eq!(
+            controller.worker(worker).unwrap().state(),
+            WorkerState::Terminating
+        );
+        controller.terminate_worker(worker).unwrap();
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+    }
+
+    #[test]
+    fn frame_detach_terminates_workers_for_root_and_descendant_documents() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let child = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Inherited)
+            .unwrap();
+        let root_document = controller.current_document_id(root).unwrap();
+        let child_document = controller.current_document_id(child).unwrap();
+        controller
+            .create_dedicated_worker(root_document, "https://a.example/root-worker.js")
+            .unwrap();
+        controller
+            .create_dedicated_worker(child_document, "https://a.example/child-worker.js")
+            .unwrap();
+        assert_eq!(controller.active_worker_count(), 2);
+        assert_eq!(controller.detach_frame(root).unwrap(), 2);
+        assert_eq!(controller.active_worker_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 0);
+    }
+
+    #[test]
     fn inherited_origin_mode_rejects_non_about_urls() {
         use super::navigation::{NavigationController, NavigationError, NavigationMode};
         let mut controller = NavigationController::new(MockRuntime::default()).unwrap();

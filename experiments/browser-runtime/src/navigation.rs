@@ -41,6 +41,15 @@ impl NavigationId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WorkerId(u64);
+
+impl WorkerId {
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavigationMode {
     /// Resolve a fresh tuple origin from the target URL.
@@ -57,6 +66,8 @@ pub enum NavigationError<E> {
     UnknownFrame,
     UnknownDocument,
     UnknownNavigation,
+    UnknownWorker,
+    CrossOriginWorkerScript,
     NoCurrentDocument,
     NavigationNotPending,
     RedirectNotAllowed,
@@ -72,6 +83,9 @@ impl<E: fmt::Display> fmt::Display for NavigationError<E> {
             Self::UnknownFrame => formatter.write_str("unknown Frame"),
             Self::UnknownDocument => formatter.write_str("unknown Document"),
             Self::UnknownNavigation => formatter.write_str("unknown Navigation"),
+            Self::UnknownWorker => formatter.write_str("unknown Dedicated Worker"),
+            Self::CrossOriginWorkerScript => formatter
+                .write_str("Dedicated Worker script is not same-origin with its owner Document"),
             Self::NoCurrentDocument => formatter.write_str("Frame has no current Document"),
             Self::NavigationNotPending => {
                 formatter.write_str("Navigation is not pending on its Frame")
@@ -151,6 +165,44 @@ impl<R: OriginRealmRuntime> Clone for Navigation<R> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerState {
+    Running,
+    Terminating,
+}
+
+/// Dedicated Worker lifecycle record. Script loading and WorkerGlobalScope
+/// execution are deliberately outside this Phase 0 ownership model.
+pub struct DedicatedWorker<R: OriginRealmRuntime> {
+    id: WorkerId,
+    owner_document: DocumentId,
+    script_url: String,
+    origin: OriginGroupId,
+    realm: R::Realm,
+    state: WorkerState,
+}
+
+impl<R: OriginRealmRuntime> DedicatedWorker<R> {
+    pub const fn id(&self) -> WorkerId {
+        self.id
+    }
+    pub const fn owner_document(&self) -> DocumentId {
+        self.owner_document
+    }
+    pub fn script_url(&self) -> &str {
+        &self.script_url
+    }
+    pub const fn origin(&self) -> OriginGroupId {
+        self.origin
+    }
+    pub const fn realm(&self) -> R::Realm {
+        self.realm
+    }
+    pub const fn state(&self) -> WorkerState {
+        self.state
+    }
+}
+
 /// Owns Frame/Document/Navigation references and delegates Realm lifetime to
 /// `OriginRealmCoordinator`. No network, parser, layout, or Worker is included.
 pub struct NavigationController<R: OriginRealmRuntime> {
@@ -158,9 +210,11 @@ pub struct NavigationController<R: OriginRealmRuntime> {
     frames: HashMap<FrameId, Frame>,
     documents: HashMap<DocumentId, Document<R>>,
     navigations: HashMap<NavigationId, Navigation<R>>,
+    workers: HashMap<WorkerId, DedicatedWorker<R>>,
     next_frame_id: u64,
     next_document_id: u64,
     next_navigation_id: u64,
+    next_worker_id: u64,
     max_redirects: usize,
 }
 
@@ -178,9 +232,11 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             frames: HashMap::new(),
             documents: HashMap::new(),
             navigations: HashMap::new(),
+            workers: HashMap::new(),
             next_frame_id: 1,
             next_document_id: 1,
             next_navigation_id: 1,
+            next_worker_id: 1,
             max_redirects,
         })
     }
@@ -408,6 +464,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         let old_document_id = frame.current_document;
         let document_id = self.allocate_document_id()?;
         if let Some(old_document_id) = old_document_id {
+            self.terminate_document_workers(old_document_id)?;
             let old_document = self
                 .documents
                 .get(&old_document_id)
@@ -481,11 +538,13 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             .get(&frame)
             .and_then(|entry| entry.current_document);
         if let Some(document_id) = current_document {
-            let document = self
+            self.terminate_document_workers(document_id)?;
+            let document_realm = self
                 .documents
                 .get(&document_id)
-                .ok_or(NavigationError::UnknownDocument)?;
-            self.coordinator.destroy_realm(document.realm)?;
+                .ok_or(NavigationError::UnknownDocument)?
+                .realm;
+            self.coordinator.destroy_realm(document_realm)?;
             self.documents.remove(&document_id);
         }
         let removed = self
@@ -498,6 +557,100 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             parent_frame.children.remove(&frame);
         }
         Ok(detached + 1)
+    }
+
+    /// Creates a Dedicated Worker Realm for a script URL that resolves to the
+    /// owning Document's canonical Origin Group. Redirect/fetch checks remain
+    /// unimplemented; this validates only the initial script URL origin.
+    pub fn create_dedicated_worker(
+        &mut self,
+        owner_document: DocumentId,
+        script_url: &str,
+    ) -> Result<WorkerId, NavigationError<R::Error>> {
+        let owner_origin = self
+            .documents
+            .get(&owner_document)
+            .ok_or(NavigationError::UnknownDocument)?
+            .origin;
+        let id = self.allocate_worker_id()?;
+        let realm = self.coordinator.create_realm_for_url(script_url)?;
+        let origin = match self.coordinator.origin_group_for_realm(realm) {
+            Some(origin) => origin,
+            None => {
+                self.coordinator.destroy_realm(realm)?;
+                return Err(NavigationError::Coordinator(
+                    BrowserRuntimeOriginError::UnknownRealm,
+                ));
+            }
+        };
+        if origin != owner_origin {
+            self.coordinator.destroy_realm(realm)?;
+            return Err(NavigationError::CrossOriginWorkerScript);
+        }
+        self.workers.insert(
+            id,
+            DedicatedWorker {
+                id,
+                owner_document,
+                script_url: script_url.to_owned(),
+                origin,
+                realm,
+                state: WorkerState::Running,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Marks a Worker Terminating before destroying its Realm. If Runtime
+    /// teardown fails, the record remains retryable in the Terminating state.
+    pub fn terminate_worker(&mut self, worker: WorkerId) -> Result<(), NavigationError<R::Error>> {
+        let worker_record = self
+            .workers
+            .get_mut(&worker)
+            .ok_or(NavigationError::UnknownWorker)?;
+        worker_record.state = WorkerState::Terminating;
+        let realm = worker_record.realm;
+        self.coordinator.destroy_realm(realm)?;
+        self.workers.remove(&worker);
+        Ok(())
+    }
+
+    fn terminate_document_workers(
+        &mut self,
+        document: DocumentId,
+    ) -> Result<usize, NavigationError<R::Error>> {
+        let mut workers = self
+            .workers
+            .values()
+            .filter(|worker| worker.owner_document == document)
+            .map(|worker| worker.id)
+            .collect::<Vec<_>>();
+        workers.sort_by_key(|worker| worker.0);
+        let mut terminated = 0;
+        for worker in workers {
+            self.terminate_worker(worker)?;
+            terminated += 1;
+        }
+        Ok(terminated)
+    }
+
+    pub fn worker(&self, worker: WorkerId) -> Option<&DedicatedWorker<R>> {
+        self.workers.get(&worker)
+    }
+
+    pub fn workers_for_document(&self, document: DocumentId) -> Vec<WorkerId> {
+        let mut workers = self
+            .workers
+            .values()
+            .filter(|worker| worker.owner_document == document)
+            .map(|worker| worker.id)
+            .collect::<Vec<_>>();
+        workers.sort_by_key(|worker| worker.0);
+        workers
+    }
+
+    pub fn active_worker_count(&self) -> usize {
+        self.workers.len()
     }
 
     pub fn current_document_id(&self, frame: FrameId) -> Option<DocumentId> {
@@ -589,6 +742,15 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         let id = NavigationId(self.next_navigation_id);
         self.next_navigation_id = self
             .next_navigation_id
+            .checked_add(1)
+            .ok_or(NavigationError::IdExhausted)?;
+        Ok(id)
+    }
+
+    fn allocate_worker_id(&mut self) -> Result<WorkerId, NavigationError<R::Error>> {
+        let id = WorkerId(self.next_worker_id);
+        self.next_worker_id = self
+            .next_worker_id
             .checked_add(1)
             .ok_or(NavigationError::IdExhausted)?;
         Ok(id)

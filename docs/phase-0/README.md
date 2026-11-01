@@ -422,3 +422,13 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 
 - This is an in-memory policy model, not connected to the C `SCM_RIGHTS` PoC or a production Broker. The caller must bind the supplied identity to a kernel-authenticated socket and Broker-owned process handle, execute the returned termination action, and call `release_renderer()` only after process exit is confirmed.
 - No durable grant journal, expiry, cryptographic token, cross-process synchronization, concurrent scheduler, or host-level resource quota exists. `rctl` remains blocked by `kern.racct.enable=0`.
+
+
+## Incremental R&D record｜2026-11-01（Dedicated Worker ownership lifecycle）
+
+- `NavigationController` now tracks Dedicated Worker IDs, owner Document IDs, script URLs, Origin Groups, Realm handles, and `Running` / `Terminating` states.
+- Worker script initial URL must resolve to the owning Document's canonical Origin Group. Cross-origin scripts are rejected and the temporary candidate Realm is released. A Worker receives a distinct JS Realm while sharing its owner Document's Origin Group.
+- Document navigation commit and Frame subtree detach terminate all Workers owned by the Document before destroying its Realm. Runtime teardown failures leave the Worker in `Terminating` so cleanup can be retried; a failed Worker teardown prevents Document commit/detach from completing.
+- Dedicated Worker ownership tests cover same-origin Realm separation, cross-origin rejection without Realm leaks, termination retry, Document replacement, and recursive Frame detach.
+
+**Scope limits:** this is an ownership/lifetime model only. It does not fetch or validate redirected Worker scripts, create `WorkerGlobalScope`, implement Worker event loops, `postMessage`/structured clone, CSP/referrer policy, module/classic script semantics, SharedWorker, or ServiceWorker.
