@@ -806,13 +806,17 @@ mod tests {
 
     #[test]
     fn client_rejects_response_without_newline_terminator() {
-        use std::io::Write;
+        use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
         let path = socket_path("truncated");
         let listener = UnixListener::bind(&path).expect("bind truncated response listener");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept client");
+            let mut request = Vec::new();
+            BufReader::new(stream.try_clone().expect("clone client stream"))
+                .read_until(b'\n', &mut request)
+                .expect("read complete client request before closing");
             stream
                 .write_all(b"{\"result\":true}")
                 .expect("write partial response");

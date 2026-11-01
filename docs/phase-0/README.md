@@ -346,3 +346,9 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Peer UID authentication is available through a FreeBSD kernel helper and used by the test server, but the full authorization/capability policy is not yet integrated.
 - No request replay/idempotency store, per-peer quotas, concurrent scheduling, cancellation token, durable task journal, or production broker crash recovery exists.
 - The five-second timeout is a local stream I/O deadline, not a full end-to-end task deadline.
+
+
+### CI portability correction — 2026-11-01
+- GitHub Actions Run 41281608108 exposed a Linux-only test-harness difference: the truncated-response mock server closed the Unix socket while the client request was still unread, so Linux reported ConnectionReset instead of the test's expected UnexpectedEof.
+- The mock server now reads the complete newline-terminated request before writing its deliberately truncated response and closing. This isolates the intended response-framing condition and avoids platform-dependent reset behavior.
+- Reverified locally on FreeBSD: UDS 17/17 and full workspace 88/88; fmt and Clippy pass. The corrected test is awaiting the next GitHub Actions run.
