@@ -206,6 +206,51 @@ static int test_rejects_multiple_storage_fds(void)
     return 0;
 }
 
+static int test_rejects_wrong_marker_and_closes_fd(void)
+{
+    int channels[2] = {-1, -1};
+    int source_fd = STDIN_FILENO;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) return -1;
+    pid_t child = fork();
+    if (child < 0) { (void)close(channels[0]); (void)close(channels[1]); return -1; }
+    if (child == 0) {
+        (void)close(channels[0]);
+        if (dup2(channels[1], RENDERER_IPC_FD) < 0) _exit(EXIT_FAILURE);
+        if (channels[1] != RENDERER_IPC_FD) (void)close(channels[1]);
+        closefrom(RENDERER_IPC_FD + 1);
+        int result = receive_origin_storage_fd(RENDERER_IPC_FD);
+        if (result >= 0) { (void)close(result); _exit(EXIT_FAILURE); }
+        errno = 0;
+        if (fcntl(ORIGIN_STORAGE_FD, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
+        _exit(EXIT_SUCCESS);
+    }
+    (void)close(channels[1]);
+    char marker = 'X';
+    struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
+    char control[CMSG_SPACE(sizeof(source_fd))];
+    memset(control, 0, sizeof(control));
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (header == NULL) { (void)close(channels[0]); (void)waitpid(child, NULL, 0); return -1; }
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(source_fd));
+    memcpy(CMSG_DATA(header), &source_fd, sizeof(source_fd));
+    ssize_t sent = sendmsg(channels[0], &message, 0);
+    (void)close(channels[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0 || sent != (ssize_t)sizeof(marker) ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) return -1;
+    (void)puts("PASS: invalid SCM_RIGHTS marker rejected; received descriptor closed");
+    (void)fflush(stdout);
+    return 0;
+}
+
 static int renderer_read_origin_a(int inherited_ipc_fd, int inherited_origin_a_fd, int inherited_origin_b_fd)
 {
     if (dup2(inherited_ipc_fd, RENDERER_IPC_FD) < 0) {
@@ -318,6 +363,10 @@ int main(void)
     root_created = 1;
     if (test_rejects_multiple_storage_fds() != 0) {
         (void)fprintf(stderr, "FAIL: malformed SCM_RIGHTS descriptor cleanup test\n");
+        goto cleanup;
+    }
+    if (test_rejects_wrong_marker_and_closes_fd() != 0) {
+        (void)fprintf(stderr, "FAIL: invalid SCM_RIGHTS marker cleanup test\n");
         goto cleanup;
     }
     (void)snprintf(origin_a, sizeof(origin_a), "%s/origin-a", root);
