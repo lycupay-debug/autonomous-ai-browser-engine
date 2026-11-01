@@ -1,10 +1,9 @@
 use std::env;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use aibe_control_protocol_uds_poc::snapshot_frame::write_dom_snapshot_frame;
-use serde_json::json;
+use aibe_control_protocol_uds_poc::snapshot_frame::read_dom_snapshot_frame;
 
 fn main() -> io::Result<()> {
     let mut arguments = env::args_os().skip(1);
@@ -14,30 +13,28 @@ fn main() -> io::Result<()> {
     let socket_path = arguments
         .next()
         .ok_or_else(|| io::Error::other("missing socket path"))?;
-    if arguments.next().is_some() || mode != "send" {
+    if arguments.next().is_some() || mode != "receive" {
         return Err(io::Error::other(
-            "usage: snapshot-frame-peer send <socket-path>",
+            "usage: snapshot-frame-peer receive <socket-path>",
         ));
     }
 
     let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let payload = serde_json::to_vec(&json!({
-        "envelopeVersion": 1,
-        "documentId": "7",
-        "revision": "3",
-        "tree": {
-            "schemaVersion": 1,
-            "root": 0,
-            "nodeCount": 3,
-            "nodes": [
-                {"id": 0, "parent": null, "children": [2], "type": "document", "nodeType": 9},
-                {"id": 2, "parent": 0, "children": [3], "type": "element", "nodeType": 1, "name": "p"},
-                {"id": 3, "parent": 2, "children": [], "type": "text", "nodeType": 3, "value": "from child process"}
-            ]
-        }
-    }))
-    .map_err(io::Error::other)?;
-    write_dom_snapshot_frame(&mut stream, 99, &payload)?;
-    stream.shutdown(std::net::Shutdown::Write)
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut first_byte = [0_u8; 1];
+    match stream.read(&mut first_byte)? {
+        0 => return Ok(()), // Broker deliberately sent no frame after denying authorization.
+        1 => {}
+        _ => unreachable!("one-byte read cannot return more than one byte"),
+    }
+    // Preserve the first byte so read_dom_snapshot_frame can distinguish a
+    // clean EOF (handled above) from a truncated header or payload (an error).
+    let mut prefixed = std::io::Cursor::new(first_byte).chain(&mut stream);
+    let frame = read_dom_snapshot_frame(&mut prefixed)?;
+    if frame.request_id != 99 || frame.document_id != 7 || frame.revision != 3 {
+        return Err(io::Error::other(
+            "received snapshot identity did not match the test contract",
+        ));
+    }
+    Ok(())
 }
