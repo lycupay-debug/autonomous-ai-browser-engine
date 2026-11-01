@@ -45,6 +45,9 @@ pub struct FreeBsdJailConfig {
     /// Remove this dedicated rootfs after Jail teardown. The caller retains
     /// ownership when false; true is recommended for ephemeral Renderer roots.
     pub cleanup_rootfs_on_exit: bool,
+    /// Optional bounded post-ingestion idle timeout passed to the Renderer.
+    /// Values are milliseconds and must be between 1s and 5m.
+    pub renderer_idle_timeout_ms: Option<u64>,
     pub args: Vec<OsString>,
 }
 
@@ -272,6 +275,9 @@ impl RendererSupervisor {
             .env("PATH", "/bin:/usr/bin:/usr/sbin")
             .env("HOME", "/nonexistent")
             .env("AIBE_RENDERER_INSTANCE_ID", renderer_id.value().to_string());
+        if let Some(timeout_ms) = config.renderer_idle_timeout_ms {
+            launcher_command.env("AIBE_RENDERER_IDLE_TIMEOUT_MS", timeout_ms.to_string());
+        }
         if let Some(library_path) = &config.library_path {
             launcher_command.env("LD_LIBRARY_PATH", library_path);
         }
@@ -482,6 +488,15 @@ impl Drop for DevfsMount {
 
 #[cfg(target_os = "freebsd")]
 fn validate_jail_config(config: &FreeBsdJailConfig) -> io::Result<()> {
+    if config
+        .renderer_idle_timeout_ms
+        .is_some_and(|value| !(1_000..=300_000).contains(&value))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Renderer idle timeout must be between 1000 and 300000 ms",
+        ));
+    }
     let valid_name = !config.name.is_empty()
         && config.name.len() <= 63
         && config

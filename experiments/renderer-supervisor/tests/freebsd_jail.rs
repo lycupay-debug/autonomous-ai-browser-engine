@@ -74,6 +74,7 @@ impl TestRootfs {
                 ..Default::default()
             },
             cleanup_rootfs_on_exit: true,
+            renderer_idle_timeout_ms: None,
             args: Vec::new(),
         }
     }
@@ -260,6 +261,7 @@ fn supervisor_rejects_host_root_as_renderer_rootfs() {
         library_path: None,
         rctl_limits: Default::default(),
         cleanup_rootfs_on_exit: true,
+        renderer_idle_timeout_ms: None,
         args: Vec::new(),
     };
     let mut supervisor = RendererSupervisor::new(std::env::temp_dir());
@@ -295,6 +297,12 @@ fn supervisor_rejects_unsafe_rootfs_and_invalid_limits_before_jail_creation() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     config.rctl_limits.maxproc = Some(2);
+    config.renderer_idle_timeout_ms = Some(999);
+    let error = supervisor
+        .spawn_in_jail(&config, Duration::from_secs(1))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    config.renderer_idle_timeout_ms = None;
 
     let principal = supervisor
         .spawn_in_jail(&config, Duration::from_secs(8))

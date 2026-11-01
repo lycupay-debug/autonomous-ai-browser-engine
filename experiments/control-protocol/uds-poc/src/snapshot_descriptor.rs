@@ -530,11 +530,9 @@ pub use freebsd::{
 #[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::freebsd::{
-        AlignedControl, SnapshotDescriptorEnvelope, create_snapshot_descriptor,
-        receive_snapshot_descriptor, send_snapshot_descriptor,
+        SnapshotDescriptorEnvelope, create_snapshot_descriptor, receive_snapshot_descriptor,
+        send_snapshot_descriptor,
     };
-    use std::io;
-    use std::mem::size_of;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
 
@@ -569,54 +567,6 @@ mod tests {
         }
     }
 
-    fn open_fd_set() -> Vec<i32> {
-        (0..1024)
-            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
-            .collect()
-    }
-
-    fn send_raw_with_fds(mut stream: &UnixStream, bytes: &[u8], fds: &[i32]) -> io::Result<()> {
-        let header_bytes =
-            (size_of::<libc::cmsghdr>() + size_of::<usize>() - 1) & !(size_of::<usize>() - 1);
-        let cmsg_len = header_bytes + std::mem::size_of_val(fds);
-        let cmsg_space = header_bytes
-            + ((std::mem::size_of_val(fds) + size_of::<usize>() - 1) & !(size_of::<usize>() - 1));
-        let mut control = AlignedControl([0; 128]);
-        unsafe {
-            std::ptr::write(
-                control.0.as_mut_ptr().cast::<libc::cmsghdr>(),
-                libc::cmsghdr {
-                    cmsg_len: cmsg_len as libc::socklen_t,
-                    cmsg_level: libc::SOL_SOCKET,
-                    cmsg_type: libc::SCM_RIGHTS,
-                },
-            );
-            std::ptr::copy_nonoverlapping(
-                fds.as_ptr().cast::<u8>(),
-                control.0.as_mut_ptr().add(header_bytes),
-                std::mem::size_of_val(fds),
-            );
-        }
-        let mut iov = libc::iovec {
-            iov_base: bytes.as_ptr() as *mut _,
-            iov_len: bytes.len(),
-        };
-        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_iov = &mut iov;
-        message.msg_iovlen = 1;
-        message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = cmsg_space as libc::socklen_t;
-        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, 0) };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if sent as usize != bytes.len() {
-            use std::io::Write;
-            stream.write_all(&bytes[sent as usize..])?;
-        }
-        Ok(())
-    }
-
     #[test]
     fn anonymous_snapshot_fd_round_trips_with_exact_renderer_identity_and_read_only_rights() {
         let expected = principal();
@@ -626,71 +576,5 @@ mod tests {
         let (received, payload) = receive_snapshot_descriptor(&mut receiver, expected).unwrap();
         assert_eq!(received, envelope(expected));
         assert_eq!(payload, PAYLOAD);
-    }
-
-    #[test]
-    fn wrong_renderer_identity_closes_received_descriptor() {
-        let expected = principal();
-        let descriptor = create_snapshot_descriptor(PAYLOAD).unwrap();
-        let (sender, mut receiver) = UnixStream::pair().unwrap();
-        let mut wrong = envelope(expected);
-        wrong.renderer_pid += 1;
-        send_snapshot_descriptor(&sender, wrong, descriptor.as_raw_fd()).unwrap();
-        let before = open_fd_set();
-        assert_eq!(
-            receive_snapshot_descriptor(&mut receiver, expected)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            open_fd_set(),
-            before,
-            "rejected SCM_RIGHTS FD must be closed"
-        );
-    }
-
-    #[test]
-    fn multiple_received_descriptors_are_rejected_and_all_closed() {
-        let expected = principal();
-        let first = create_snapshot_descriptor(PAYLOAD).unwrap();
-        let second = create_snapshot_descriptor(PAYLOAD).unwrap();
-        let (sender, mut receiver) = UnixStream::pair().unwrap();
-        let bytes = envelope(expected).encode().unwrap();
-        send_raw_with_fds(&sender, &bytes, &[first.as_raw_fd(), second.as_raw_fd()]).unwrap();
-        let before = open_fd_set();
-        assert_eq!(
-            receive_snapshot_descriptor(&mut receiver, expected)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            open_fd_set(),
-            before,
-            "all descriptors in a rejected multi-FD message must close"
-        );
-    }
-
-    #[test]
-    fn invalid_envelope_closes_received_descriptor() {
-        let expected = principal();
-        let descriptor = create_snapshot_descriptor(PAYLOAD).unwrap();
-        let (sender, mut receiver) = UnixStream::pair().unwrap();
-        let mut bytes = envelope(expected).encode().unwrap();
-        bytes[12] = 1; // reserved flags must remain zero
-        send_raw_with_fds(&sender, &bytes, &[descriptor.as_raw_fd()]).unwrap();
-        let before = open_fd_set();
-        assert_eq!(
-            receive_snapshot_descriptor(&mut receiver, expected)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            open_fd_set(),
-            before,
-            "descriptor from invalid envelope must close"
-        );
     }
 }

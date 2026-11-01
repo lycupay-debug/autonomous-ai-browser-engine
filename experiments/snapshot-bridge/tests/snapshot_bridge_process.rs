@@ -51,6 +51,7 @@ impl RendererRootfs {
             library_path: Some(PathBuf::from("/usr/local/lib")),
             rctl_limits: Default::default(),
             cleanup_rootfs_on_exit: true,
+            renderer_idle_timeout_ms: None,
             args: Vec::new(),
         }
     }

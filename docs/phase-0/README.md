@@ -812,3 +812,71 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 ### GitHub 交付状态
 
 - 本子阶段代码将通过独立 PR 提交；只有 Rust 与 supply-chain CI 均成功、PR 合并后，才把该交付标记为主分支已集成。
+
+## 增量研发记录｜2026-11-02（10/50/100 Renderer 并发与持续运行压力测试）
+
+### 目标与测试范围
+
+- 验证 `RendererSupervisor::spawn_in_jail()` 在 10、50、100 个并发实例下的启动、身份登记、Snapshot grant 传输、持续存活、异常退出回收和批量 teardown。
+- 每个实例均使用独立 FreeBSD Jail、独立 rootfs、低权限 UID/GID 65534、独立 UDS 与真实 `snapshot-bridge-renderer` V8 Runtime。
+- 每个 Renderer 接收同一个小型静态 DOM Snapshot，在 Capsicum capability mode 下完成既有 V8 ingestion；不是复杂网页、脚本压力或真实网络负载。
+- 新增 `experiments/snapshot-bridge/tests/renderer_stress.rs`，可通过 `AIBE_STRESS_COUNTS=10,50,100` 和 `AIBE_STRESS_HOLD_SECS=<seconds>` 选择档位与持续时间。FreeBSD 默认测试档位为 10/50/100，每档保持 15 秒。
+- 为测试期间延长 Broker UDS 的 idle read timeout，`FreeBsdJailConfig::renderer_idle_timeout_ms` 提供 1,000–300,000 ms 的可选值；未设置时 Renderer 保持原 5 秒 PoC 默认值。该参数不代表已确定生产 Renderer 生命周期策略。
+
+### FreeBSD 15.1-RELEASE-p6 实测
+
+| 指标 | 10 Renderer | 50 Renderer | 100 Renderer |
+| --- | ---: | ---: | ---: |
+| 启动总窗口 | 0.29 s | 1.21 s | 2.56 s |
+| 平均单实例 spawn | 27 ms | 22 ms | 23 ms |
+| P95 单实例 spawn | — | — | 32 ms |
+| 最大单实例 spawn | — | — | 59 ms |
+| 线程总数 | 20 | 100 | 200 |
+| RSS 合计（短时采样） | 约 348 MiB | 约 1,739 MiB | 约 2,193 MiB（180 秒稳态样本） |
+| Jail `memoryuse` | 约 35 MiB/实例 | 约 35 MiB/实例 | 约 23 MiB/实例（180 秒结束采样） |
+
+100 Renderer 额外持续运行 180 秒：
+
+- 100 个 Renderer 在持续窗口内均存活；没有非预期退出。
+- 进程 RSS 首次采样约 2,392 MiB，随后下降并稳定在约 2,193 MiB；每个 Jail 结束采样 `memoryuse` 约 23 MiB。
+- Host 可回收内存最低约 5,091 MiB，随后回升至约 5,706 MiB。
+- 主机 `swapinfo` 使用量保持约 11 MiB；未观察到随 Renderer 数量持续增加的主机 Swap 使用。
+- `maxproc=1`、`nthr=2`；每个 Jail 一个 Renderer 进程、两个线程。
+- 故意 `SIGKILL` 一个 Renderer 后，Supervisor 检测进程退出并释放其 Snapshot grant；其余 99 个实例正常关闭。100 Jail teardown 约 0.6 秒。
+- 测试结束后 `jls` 无实验 Jail，`rctl` 无实验规则，临时 rootfs 均删除。
+
+### RACCT 指标解释与限制
+
+- `openfiles=128` 是 RACCT 报告的 descriptor-table capacity，不等于 128 个已打开文件。对该实例执行 `procstat -f`，实际只存在 FD 0–3；其余条目是进程的 text/cwd/root/jail 引用。不能把 `openfiles` 计数直接解释为活跃 FD 数量。
+- V8 每实例 `vmemoryuse` 约 1,444 GiB，`swapuse` 约 1.5 TiB；同一时刻主机 `swapinfo` 仅约 11 MiB。虚拟地址空间预留和 RACCT swap reservation 不能等同于实际驻留物理内存或主机 Swap I/O。
+- 本次仅有小型 Snapshot ingestion，没有真实页面持续执行脚本、复杂 DOM/CSS、网络出站、媒体解码或多标签页负载。RSS、memoryuse、vmemoryuse、swapuse 均不能直接转化为生产配额。
+- 未配置持久 RCTL 限额；不对 `user:root`、`user:postgres`、GSM 或全局 scope 添加规则。正式 RCTL 预算须在更真实负载和峰值采样后单独评审。
+
+### 代码与回归验证
+
+- 新增 FreeBSD staged stress integration test，覆盖 10/50/100 实例启动、Snapshot grant、持续存活、Renderer crash、grant release、Supervisor shutdown 与 rootfs/Jail 清理。
+- 将 SCM_RIGHTS malformed-message FD cleanup 的三项测试移动到单独 integration-test 进程，避免与同 crate 并行单元测试共享进程 FD table 导致 `open_fd_set()` 快照误报；测试内容仍覆盖错误 Renderer identity、非法 envelope 与多 FD 拒绝后的 descriptor cleanup。
+- Workspace：`cargo test --workspace --locked --offline`，197 passed / 0 failed（包含默认 10/50/100 压力档位）。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`：通过。
+- `git diff --check`：通过。
+- `scripts/run-security-pocs.sh`：通过，包含 Capsicum FD rights、Broker/Renderer boundary、UDS peer credentials、Origin storage SCM_RIGHTS、Renderer crash recovery、Jail network isolation、Renderer Jail lifecycle/identity/RCTL。
+- 100 Renderer / 180 秒独立长时测试通过；故障 Renderer 的 grant release 和 99 实例 teardown 通过。
+
+### 结论与未完成边界
+
+- **已验证：** 当前 FreeBSD 15.1 V8 Snapshot Renderer PoC 可在每 Renderer 一个独立 Jail 的模型下达到 100 个并发实例，并连续保持 180 秒；Supervisor 能在该规模下处理一个 Renderer 强制退出、grant 清理与批量 teardown。
+- **未验证：** 复杂网站、真实脚本/事件循环负载、长时间高 CPU、真实 Network Service 出站、CSS/Layout/Paint、下载与持久存储压力，以及生产级资源预算。
+- **不做生产限额决策：** 本次资源数据仅作为小型 Snapshot workload 基线；尤其不以 `vmemoryuse` / `swapuse` 虚拟预留数值作为物理内存/Swap 限额。
+- 阶段 0 仍未完成，不进入阶段 1；未部署浏览器服务，未重启 GSM、PostgreSQL、Caddy 或主机，未修改持久 Jail/RCTL/rc.conf/loader.conf 配置。
+
+### 下一子阶段
+
+1. 接入生产 Network Service/Broker 出站路径：Jail 内 Renderer 不开放直连网络，由宿主 Broker/Network Service 执行 DNS、目标 IP、重定向、TLS 与响应体策略。
+2. 将真实导航与 Document/Frame/Worker 生命周期接入 Renderer Supervisor；覆盖多 Document、多个页面和并发 Snapshot 更新。
+3. 建立复杂页面、脚本持续执行、DOM Mutation、资源加载与多标签页混合压力工作负载，再采集 CPU、RSS、memoryuse、线程、FD、启动/teardown 峰值。
+4. 基于完整工作负载数据制定 per-Jail RCTL 预算；GSM、PostgreSQL 与宿主可信服务保持在限制范围之外。
+
+### GitHub 交付状态
+
+- 当前实现位于独立分支 `work/renderer-concurrency-stress`，待提交 PR；Linux CI 不执行 FreeBSD 专用 Jail stress test，FreeBSD 15.1 本机结果作为目标平台原生验证证据单独记录。
