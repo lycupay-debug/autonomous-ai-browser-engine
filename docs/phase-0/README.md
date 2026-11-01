@@ -187,3 +187,10 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - Added opaque `JsRealmId` handles bound to a monotonically allocated Rust Runtime identity, independent V8 Context creation/destruction, and typed evaluation within a selected Realm. Handles from another Runtime are rejected before FFI dispatch; tests verify isolation between two Realms and the default Context, cross-Runtime rejection, explicit destruction, stale-handle rejection, and continued operation of a surviving Realm. The focused Realm lifecycle test passed 20/20 independent test-process runs.
 - Realm PoC currently provides isolated ECMAScript globals only; project DOM host bindings are not yet installed into secondary Realms. Cross-Realm wrapper identity, security tokens/origin policy, host callbacks, native host objects, structured exception types, Agent/Worker integration, and HTML Event Loop scheduling remain open.
 - This is still a Phase 0 boundary proof, not a frozen production API.
+
+## Structured JavaScript evaluation errors — 2026-11-01
+
+- Extended `JsRuntimeError` with the adapter status code, V8 message text, and optional source line/start-column metadata. Adapter-side failures retain a generic message and omit source coordinates.
+- The narrow C ABI now copies V8 `TryCatch::Message()` text with an explicit byte length and returns line/start-column separately. Missing columns use an explicit sentinel and become `None` in Rust; V8 objects and exception handles do not cross the FFI boundary.
+- Tests verify syntax errors include a message and source location, and runtime exceptions preserve the thrown Error message and the second source line. V8 FFI tests remain 15/15; the full workspace remains 52/52. Formatting and Clippy with `-D warnings` pass.
+- The error model does not yet expose stack traces, structured thrown values, nested causes, or a cross-engine error taxonomy. V8 message/location data may be absent for some abrupt completions; the adapter status remains the stable fallback signal.

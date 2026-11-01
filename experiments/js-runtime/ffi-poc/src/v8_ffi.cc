@@ -708,6 +708,56 @@ enum AibeJsValueTag : int {
     AIBE_JS_VALUE_TAG_UNSUPPORTED = 5,
 };
 
+static void copy_v8_exception_details(
+    v8::Isolate* isolate,
+    v8::TryCatch& try_catch,
+    v8::Local<v8::Context> context,
+    char* output,
+    size_t capacity,
+    size_t* output_length,
+    uint32_t* error_line,
+    uint32_t* error_column)
+{
+    if (output_length != nullptr) {
+        *output_length = 0;
+    }
+    if (error_line != nullptr) {
+        *error_line = 0;
+    }
+    if (error_column != nullptr) {
+        *error_column = UINT32_MAX;
+    }
+
+    auto message = try_catch.Message();
+    if (message.IsEmpty()) {
+        return;
+    }
+
+    if (error_line != nullptr) {
+        auto line = message->GetLineNumber(context);
+        if (line.IsJust() && line.FromJust() > 0) {
+            *error_line = static_cast<uint32_t>(line.FromJust());
+        }
+    }
+    if (error_column != nullptr) {
+        auto column = message->GetStartColumn(context);
+        if (column.IsJust() && column.FromJust() >= 0) {
+            *error_column = static_cast<uint32_t>(column.FromJust());
+        }
+    }
+
+    if (output == nullptr || output_length == nullptr || capacity == 0) {
+        return;
+    }
+    v8::String::Utf8Value utf8(isolate, message->Get());
+    if (*utf8 == nullptr || utf8.length() < 0) {
+        return;
+    }
+    const size_t length = std::min(static_cast<size_t>(utf8.length()), capacity);
+    std::memcpy(output, *utf8, length);
+    *output_length = length;
+}
+
 static int aibe_v8_eval_value_in_context(
     AibeV8Runtime* runtime,
     v8::Local<v8::Context> context,
@@ -717,17 +767,22 @@ static int aibe_v8_eval_value_in_context(
     double* number_value,
     char* output,
     size_t capacity,
-    size_t* output_length)
+    size_t* output_length,
+    uint32_t* error_line,
+    uint32_t* error_column)
 {
     if (runtime == nullptr || source == nullptr || value_tag == nullptr
         || boolean_value == nullptr || number_value == nullptr
-        || output == nullptr || output_length == nullptr) {
+        || output == nullptr || output_length == nullptr
+        || error_line == nullptr || error_column == nullptr) {
         return -1;
     }
     *value_tag = -1;
     *boolean_value = 0;
     *number_value = 0.0;
     *output_length = 0;
+    *error_line = 0;
+    *error_column = UINT32_MAX;
     if (context.IsEmpty()) {
         return -8;
     }
@@ -743,10 +798,16 @@ static int aibe_v8_eval_value_in_context(
     }
     v8::Local<v8::Script> script;
     if (!v8::Script::Compile(context, text).ToLocal(&script)) {
+        copy_v8_exception_details(
+            runtime->isolate, try_catch, context, output, capacity,
+            output_length, error_line, error_column);
         return -3;
     }
     v8::Local<v8::Value> value;
     if (!script->Run(context).ToLocal(&value)) {
+        copy_v8_exception_details(
+            runtime->isolate, try_catch, context, output, capacity,
+            output_length, error_line, error_column);
         return -4;
     }
 
@@ -789,7 +850,9 @@ static int aibe_v8_eval_value_for_realm(
     double* number_value,
     char* output,
     size_t capacity,
-    size_t* output_length)
+    size_t* output_length,
+    uint32_t* error_line,
+    uint32_t* error_column)
 {
     if (opaque == nullptr) {
         return -1;
@@ -807,7 +870,8 @@ static int aibe_v8_eval_value_for_realm(
     }
     return aibe_v8_eval_value_in_context(
         runtime, found->second.Get(runtime->isolate), source,
-        value_tag, boolean_value, number_value, output, capacity, output_length);
+        value_tag, boolean_value, number_value, output, capacity, output_length,
+        error_line, error_column);
 }
 
 extern "C" int aibe_v8_eval_value(
@@ -818,7 +882,9 @@ extern "C" int aibe_v8_eval_value(
     double* number_value,
     char* output,
     size_t capacity,
-    size_t* output_length)
+    size_t* output_length,
+    uint32_t* error_line,
+    uint32_t* error_column)
 {
     if (opaque == nullptr) {
         return -1;
@@ -831,7 +897,8 @@ extern "C" int aibe_v8_eval_value(
     v8::HandleScope handle_scope(runtime->isolate);
     return aibe_v8_eval_value_in_context(
         runtime, runtime->context.Get(runtime->isolate), source,
-        value_tag, boolean_value, number_value, output, capacity, output_length);
+        value_tag, boolean_value, number_value, output, capacity, output_length,
+        error_line, error_column);
 }
 
 extern "C" int aibe_v8_create_realm(void* opaque, uint64_t* realm_id)
@@ -887,11 +954,13 @@ extern "C" int aibe_v8_eval_value_in_realm(
     double* number_value,
     char* output,
     size_t capacity,
-    size_t* output_length)
+    size_t* output_length,
+    uint32_t* error_line,
+    uint32_t* error_column)
 {
     return aibe_v8_eval_value_for_realm(
         opaque, realm_id, source, value_tag, boolean_value,
-        number_value, output, capacity, output_length);
+        number_value, output, capacity, output_length, error_line, error_column);
 }
 
 extern "C" int aibe_v8_run_microtasks(void* opaque)

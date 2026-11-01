@@ -40,14 +40,21 @@ pub trait JsRuntime {
     fn collect_garbage(&mut self) -> Result<(), JsRuntimeError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsRuntimeError {
     pub code: i32,
+    pub message: String,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
 }
 
 impl std::fmt::Display for JsRuntimeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "JavaScript Runtime adapter error {}", self.code)
+        if let (Some(line), Some(column)) = (self.line, self.column) {
+            write!(formatter, "{} at {}:{}", self.message, line, column)
+        } else {
+            write!(formatter, "{}", self.message)
+        }
     }
 }
 
@@ -55,7 +62,12 @@ impl std::error::Error for JsRuntimeError {}
 
 impl From<i32> for JsRuntimeError {
     fn from(code: i32) -> Self {
-        Self { code }
+        Self {
+            code,
+            message: format!("JavaScript Runtime adapter error {code}"),
+            line: None,
+            column: None,
+        }
     }
 }
 
@@ -84,6 +96,17 @@ mod native {
     const JS_VALUE_TAG_STRING: c_int = 4;
     const JS_VALUE_TAG_UNSUPPORTED: c_int = 5;
 
+    struct RawJsValueResult {
+        status: i32,
+        value_tag: c_int,
+        boolean_value: c_int,
+        number_value: f64,
+        output: Vec<u8>,
+        output_length: usize,
+        error_line: u32,
+        error_column: u32,
+    }
+
     unsafe extern "C" {
         fn aibe_v8_create() -> *mut c_void;
         fn aibe_v8_eval(
@@ -105,6 +128,8 @@ mod native {
             output: *mut c_char,
             capacity: usize,
             output_length: *mut usize,
+            error_line: *mut u32,
+            error_column: *mut u32,
         ) -> c_int;
         fn aibe_v8_eval_value(
             handle: *mut c_void,
@@ -115,6 +140,8 @@ mod native {
             output: *mut c_char,
             capacity: usize,
             output_length: *mut usize,
+            error_line: *mut u32,
+            error_column: *mut u32,
         ) -> c_int;
         fn aibe_v8_run_microtasks(handle: *mut c_void) -> c_int;
         fn aibe_v8_force_gc(handle: *mut c_void) -> c_int;
@@ -169,8 +196,10 @@ mod native {
                     realm_id,
                 })
             } else {
-                Err(super::JsRuntimeError {
-                    code: if status == 0 { -13 } else { status },
+                Err(if status == 0 {
+                    (-13).into()
+                } else {
+                    status.into()
                 })
             }
         }
@@ -180,7 +209,7 @@ mod native {
             realm: super::JsRealmId,
         ) -> Result<(), super::JsRuntimeError> {
             if realm.runtime_id != self.runtime_id {
-                return Err(super::JsRuntimeError { code: -14 });
+                return Err((-14).into());
             }
             let status = unsafe { aibe_v8_destroy_realm(self.handle.as_ptr(), realm.realm_id) };
             if status == 0 {
@@ -196,14 +225,16 @@ mod native {
             source: &str,
         ) -> Result<super::JsValue, super::JsRuntimeError> {
             if realm.runtime_id != self.runtime_id {
-                return Err(super::JsRuntimeError { code: -14 });
+                return Err((-14).into());
             }
-            let source = CString::new(source).map_err(|_| super::JsRuntimeError { code: -10 })?;
+            let source = CString::new(source).map_err(|_| super::JsRuntimeError::from(-10))?;
             let mut value_tag = -1;
             let mut boolean_value = 0;
             let mut number_value = 0.0;
             let mut output = vec![0_u8; 1024 * 1024];
             let mut output_length = 0;
+            let mut error_line = 0_u32;
+            let mut error_column = u32::MAX;
             let status = unsafe {
                 aibe_v8_eval_value_in_realm(
                     self.handle.as_ptr(),
@@ -215,32 +246,50 @@ mod native {
                     output.as_mut_ptr().cast(),
                     output.len(),
                     &mut output_length,
+                    &mut error_line,
+                    &mut error_column,
                 )
             };
-            Self::decode_value_result(
+            Self::decode_value_result(RawJsValueResult {
                 status,
                 value_tag,
                 boolean_value,
                 number_value,
                 output,
                 output_length,
-            )
-            .map_err(Into::into)
+                error_line,
+                error_column,
+            })
         }
 
         fn decode_value_result(
-            status: i32,
-            value_tag: c_int,
-            boolean_value: c_int,
-            number_value: f64,
-            output: Vec<u8>,
-            output_length: usize,
-        ) -> Result<super::JsValue, i32> {
-            if status != 0 {
-                return Err(status);
-            }
+            result: RawJsValueResult,
+        ) -> Result<super::JsValue, super::JsRuntimeError> {
+            let RawJsValueResult {
+                status,
+                value_tag,
+                boolean_value,
+                number_value,
+                output,
+                output_length,
+                error_line,
+                error_column,
+            } = result;
             if output_length > output.len() {
-                return Err(-11);
+                return Err((-11).into());
+            }
+            if status != 0 {
+                let message = String::from_utf8_lossy(&output[..output_length]).into_owned();
+                return Err(super::JsRuntimeError {
+                    code: status,
+                    message: if message.is_empty() {
+                        format!("JavaScript evaluation failed with status {status}")
+                    } else {
+                        message
+                    },
+                    line: (error_line > 0).then_some(error_line),
+                    column: (error_column != u32::MAX).then_some(error_column),
+                });
             }
             match value_tag {
                 JS_VALUE_TAG_UNDEFINED => Ok(super::JsValue::Undefined),
@@ -249,19 +298,24 @@ mod native {
                 JS_VALUE_TAG_NUMBER => Ok(super::JsValue::Number(number_value)),
                 JS_VALUE_TAG_STRING => String::from_utf8(output[..output_length].to_vec())
                     .map(super::JsValue::String)
-                    .map_err(|_| -12),
+                    .map_err(|_| (-12).into()),
                 JS_VALUE_TAG_UNSUPPORTED => Ok(super::JsValue::Unsupported),
-                _ => Err(-13),
+                _ => Err((-13).into()),
             }
         }
 
-        pub fn eval_value(&mut self, source: &str) -> Result<super::JsValue, i32> {
-            let source = CString::new(source).map_err(|_| -10)?;
+        pub fn eval_value(
+            &mut self,
+            source: &str,
+        ) -> Result<super::JsValue, super::JsRuntimeError> {
+            let source = CString::new(source).map_err(|_| super::JsRuntimeError::from(-10))?;
             let mut value_tag = -1;
             let mut boolean_value = 0;
             let mut number_value = 0.0;
             let mut output = vec![0_u8; 1024 * 1024];
             let mut output_length = 0;
+            let mut error_line = 0_u32;
+            let mut error_column = u32::MAX;
             let status = unsafe {
                 aibe_v8_eval_value(
                     self.handle.as_ptr(),
@@ -272,16 +326,20 @@ mod native {
                     output.as_mut_ptr().cast(),
                     output.len(),
                     &mut output_length,
+                    &mut error_line,
+                    &mut error_column,
                 )
             };
-            Self::decode_value_result(
+            Self::decode_value_result(RawJsValueResult {
                 status,
                 value_tag,
                 boolean_value,
                 number_value,
                 output,
                 output_length,
-            )
+                error_line,
+                error_column,
+            })
         }
 
         pub fn eval(&mut self, source: &str) -> Result<String, i32> {
@@ -349,7 +407,7 @@ mod native {
             &mut self,
             source: &str,
         ) -> Result<super::JsValue, super::JsRuntimeError> {
-            self.eval_value(source).map_err(Into::into)
+            self.eval_value(source)
         }
 
         fn evaluate_to_string(&mut self, source: &str) -> Result<String, super::JsRuntimeError> {
@@ -493,13 +551,19 @@ mod tests {
             runtime.eval_value("''").unwrap(),
             super::JsValue::String(String::new())
         );
-        assert_eq!(runtime.eval_value("function (").unwrap_err(), -3);
-        assert_eq!(
-            runtime
-                .eval_value("throw new Error('typed failure')")
-                .unwrap_err(),
-            -4
-        );
+        let syntax_error = runtime.eval_value("function (").unwrap_err();
+        assert_eq!(syntax_error.code, -3);
+        assert!(!syntax_error.message.is_empty());
+        assert_eq!(syntax_error.line, Some(1));
+        assert!(syntax_error.column.is_some());
+
+        let runtime_error = runtime
+            .eval_value("const valid = 1;\nthrow new Error('typed failure');")
+            .unwrap_err();
+        assert_eq!(runtime_error.code, -4);
+        assert!(runtime_error.message.contains("typed failure"));
+        assert_eq!(runtime_error.line, Some(2));
+        assert!(runtime_error.column.is_some());
         match runtime.eval_value("-0").unwrap() {
             super::JsValue::Number(value) => {
                 assert_eq!(value.to_bits(), (-0.0_f64).to_bits())
