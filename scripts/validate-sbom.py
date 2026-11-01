@@ -14,6 +14,8 @@ EXPECTED = {
     "aibe-browser-runtime-origin.cdx.json",
     "aibe-broker-policy.cdx.json",
     "aibe-html-parser.cdx.json",
+    "aibe-snapshot-bridge.cdx.json",
+    "aibe-renderer-supervisor.cdx.json",
 }
 root = Path(os.environ.get("AIBE_SBOM_DIR", Path(__file__).resolve().parents[1] / "sbom"))
 found = {path.name for path in root.glob("*.cdx.json")}

@@ -21,7 +21,9 @@ for entry in \
   "experiments/origin-policy/aibe-origin-policy-poc.cdx.json:aibe-origin-policy.cdx.json" \
   "experiments/browser-runtime/aibe-browser-runtime-origin-poc.cdx.json:aibe-browser-runtime-origin.cdx.json" \
   "experiments/broker-policy/aibe-broker-policy-poc.cdx.json:aibe-broker-policy.cdx.json" \
-  "experiments/html-parser/aibe-html-parser-poc.cdx.json:aibe-html-parser.cdx.json"
+  "experiments/html-parser/aibe-html-parser-poc.cdx.json:aibe-html-parser.cdx.json" \
+  "experiments/snapshot-bridge/aibe-snapshot-bridge-poc.cdx.json:aibe-snapshot-bridge.cdx.json" \
+  "experiments/renderer-supervisor/aibe-renderer-supervisor-poc.cdx.json:aibe-renderer-supervisor.cdx.json"
 do
   source=${entry%%:*}
   destination=${entry##*:}

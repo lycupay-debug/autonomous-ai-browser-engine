@@ -15,6 +15,7 @@ use aibe_control_protocol_uds_poc::snapshot_endpoint::{
     SnapshotTransferReceipt, send_authorized_snapshot,
 };
 use aibe_control_protocol_uds_poc::snapshot_frame::DomSnapshotFrame;
+use aibe_renderer_supervisor_poc::RendererSupervisor;
 
 /// Sends the current committed Document snapshot using only host-owned
 /// Document/Origin/revision metadata. No page-provided identity is accepted.
@@ -62,6 +63,26 @@ pub fn send_current_document_snapshot<R: OriginRealmRuntime>(
             Err(error)
         }
     }
+}
+
+/// Reserve the request ID in the process supervisor before issuing any
+/// Snapshot grant or writing bytes, then use only its authenticated stream.
+pub fn send_supervised_document_snapshot<R: OriginRealmRuntime>(
+    controller: &NavigationController<R>,
+    frame: FrameId,
+    supervisor: &mut RendererSupervisor,
+    renderer: RendererPrincipal,
+    request_id: u64,
+    grants: &mut SnapshotGrantRegistry,
+) -> io::Result<SnapshotTransferReceipt> {
+    supervisor.reserve_request(renderer, request_id)?;
+    let stream = supervisor.stream_mut(renderer).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Renderer has no authenticated supervisor connection",
+        )
+    })?;
+    send_current_document_snapshot(controller, frame, stream, renderer, request_id, grants)
 }
 
 #[cfg(test)]

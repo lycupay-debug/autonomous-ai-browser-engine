@@ -6,7 +6,7 @@
 //! owns both Child and UnixStream and releases Snapshot grants only after
 //! observing process exit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -41,15 +41,39 @@ pub struct RendererExit {
 /// Owns Renderer child processes and their authenticated Broker channels.
 pub struct RendererSupervisor {
     renderers: HashMap<RendererId, ManagedRenderer>,
+    request_ids: HashMap<RendererId, HashSet<u64>>,
+    max_total_requests: usize,
+    max_per_renderer_requests: usize,
     socket_directory: PathBuf,
 }
 
 impl RendererSupervisor {
     pub fn new(socket_directory: impl AsRef<Path>) -> Self {
-        Self {
-            renderers: HashMap::new(),
-            socket_directory: socket_directory.as_ref().to_path_buf(),
+        Self::with_request_quotas(socket_directory, 4096, 256)
+            .expect("default Renderer request quotas are valid")
+    }
+
+    pub fn with_request_quotas(
+        socket_directory: impl AsRef<Path>,
+        max_total_requests: usize,
+        max_per_renderer_requests: usize,
+    ) -> io::Result<Self> {
+        if max_total_requests == 0
+            || max_per_renderer_requests == 0
+            || max_per_renderer_requests > max_total_requests
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Renderer request quotas must be nonzero and per-Renderer quota cannot exceed global quota",
+            ));
         }
+        Ok(Self {
+            renderers: HashMap::new(),
+            request_ids: HashMap::new(),
+            max_total_requests,
+            max_per_renderer_requests,
+            socket_directory: socket_directory.as_ref().to_path_buf(),
+        })
     }
 
     /// Spawn a Renderer command and accept its private UDS connection.
@@ -62,7 +86,11 @@ impl RendererSupervisor {
     ) -> io::Result<RendererPrincipal> {
         let socket_path = self.next_socket_path()?;
         let listener = bind_private_socket(&socket_path)?;
-        listener.set_nonblocking(true)?;
+        if let Err(error) = listener.set_nonblocking(true) {
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+            return Err(error);
+        }
         command.arg(&socket_path);
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -106,6 +134,81 @@ impl RendererSupervisor {
         Ok(principal)
     }
 
+    /// Reserve a nonzero request ID for one exact Renderer process instance.
+    /// Reservations are retained after uncertain writes and released only
+    /// after the supervisor confirms that the child process has exited.
+    pub fn reserve_request(
+        &mut self,
+        principal: RendererPrincipal,
+        request_id: u64,
+    ) -> io::Result<()> {
+        if request_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request ID must be nonzero",
+            ));
+        }
+        let Some(renderer) = self.renderers.get(&principal.id()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Renderer instance is not managed",
+            ));
+        };
+        if renderer.principal != principal {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Renderer principal does not match the managed process",
+            ));
+        }
+        if self
+            .request_ids
+            .get(&principal.id())
+            .is_some_and(|ids| ids.contains(&request_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "request ID was already used by this Renderer instance",
+            ));
+        }
+        let per_renderer_count = self
+            .request_ids
+            .get(&principal.id())
+            .map_or(0, HashSet::len);
+        if per_renderer_count >= self.max_per_renderer_requests {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "per-Renderer request quota exceeded",
+            ));
+        }
+        let total = self.request_ids.values().map(HashSet::len).sum::<usize>();
+        if total >= self.max_total_requests {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "global Renderer request quota exceeded",
+            ));
+        }
+        self.request_ids
+            .entry(principal.id())
+            .or_default()
+            .insert(request_id);
+        Ok(())
+    }
+
+    pub fn active_request_count(&self) -> usize {
+        self.request_ids.values().map(HashSet::len).sum()
+    }
+
+    pub fn close_connection(&mut self, principal: RendererPrincipal) -> io::Result<()> {
+        let renderer = self
+            .renderers
+            .get(&principal.id())
+            .filter(|renderer| renderer.principal == principal)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Renderer instance is not managed")
+            })?;
+        renderer.stream.shutdown(std::net::Shutdown::Both)
+    }
+
     fn accept_child(
         &self,
         listener: &UnixListener,
@@ -116,7 +219,16 @@ impl RendererSupervisor {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let credentials = peer_process_credentials(&stream)?;
+                    let credentials = match peer_process_credentials(&stream) {
+                        Ok(credentials) => credentials,
+                        Err(_) => {
+                            // An unauthenticated local connection is not the
+                            // Renderer we spawned. Ignore it and keep waiting
+                            // within the original bounded accept deadline.
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     if credentials.pid != child.id() {
                         // Ignore an unexpected local peer; do not let it cause
                         // the supervisor to kill the child it actually spawned.
@@ -207,6 +319,7 @@ impl RendererSupervisor {
                 drop(renderer.stream);
                 let _ = std::fs::remove_file(renderer.socket_path);
             }
+            self.request_ids.remove(&id);
             let released_storage_grants = storage_grants.release_renderer(principal);
             let released_snapshot_grants = snapshot_grants.release_renderer(principal);
             results.push(RendererExit {
@@ -233,10 +346,13 @@ impl RendererSupervisor {
             })?;
             match renderer.child.try_wait()? {
                 Some(status) => status,
-                None => {
-                    renderer.child.kill()?;
-                    renderer.child.wait()?
-                }
+                None => match renderer.child.kill() {
+                    Ok(()) => renderer.child.wait()?,
+                    Err(kill_error) => match renderer.child.try_wait()? {
+                        Some(status) => status,
+                        None => return Err(kill_error),
+                    },
+                },
             }
         };
         let renderer = self
@@ -245,6 +361,7 @@ impl RendererSupervisor {
             .expect("managed Renderer retained");
         drop(renderer.stream);
         let _ = std::fs::remove_file(renderer.socket_path);
+        self.request_ids.remove(&id);
         let released_storage_grants = storage_grants.release_renderer(renderer.principal);
         let released_snapshot_grants = snapshot_grants.release_renderer(renderer.principal);
         Ok(RendererExit {

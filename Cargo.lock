@@ -98,6 +98,7 @@ dependencies = [
  "aibe-broker-policy-poc",
  "aibe-browser-runtime-origin-poc",
  "aibe-control-protocol-uds-poc",
+ "aibe-js-runtime-ffi-poc",
  "aibe-origin-policy-poc",
  "aibe-renderer-supervisor-poc",
  "serde_json",
