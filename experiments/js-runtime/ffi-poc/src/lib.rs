@@ -585,6 +585,46 @@ mod tests {
         let second = runtime.create_realm().expect("second realm is created");
         assert_ne!(first, second);
 
+        // Every Context receives its own Node host binding. Wrapper identity is
+        // stable within that Realm and does not depend on the default Context.
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(first, "typeof Node")
+                .unwrap(),
+            super::JsValue::String("function".to_string())
+        );
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(second, "typeof Node")
+                .unwrap(),
+            super::JsValue::String("function".to_string())
+        );
+        let node_identity_script = "(() => { const root = new Node(); const child = new Node(); root.appendChild(child); return root.firstChild() === child && root.firstChild() === root.firstChild(); })()";
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(first, node_identity_script)
+                .unwrap(),
+            super::JsValue::Boolean(true)
+        );
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(second, node_identity_script)
+                .unwrap(),
+            super::JsValue::Boolean(true)
+        );
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(first, "globalThis.realmMarker = 17; realmMarker")
+                .unwrap(),
+            super::JsValue::Number(17.0)
+        );
+        assert_eq!(
+            runtime
+                .evaluate_value_in_realm(second, "typeof realmMarker")
+                .unwrap(),
+            super::JsValue::String("undefined".to_string())
+        );
+
         let mut other_runtime = V8Runtime::new().expect("second runtime initializes");
         assert_eq!(
             other_runtime

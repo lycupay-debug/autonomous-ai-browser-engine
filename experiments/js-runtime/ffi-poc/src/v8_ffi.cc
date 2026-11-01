@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -68,6 +69,7 @@ struct AibeNativeNode {
 struct AibeNodeWrapper {
     AibeV8Runtime* owner;
     std::shared_ptr<AibeNativeNode> node;
+    uint64_t realm_id;
     v8::Global<v8::Object> object;
     AibeNodeWrapper* pending_next = nullptr;
 };
@@ -81,14 +83,34 @@ struct AibeV8Runtime {
     uint64_t next_realm_id = 1;
     std::thread::id owner_thread;
     v8::Global<v8::FunctionTemplate> node_template;
-    // Weak per-runtime identity cache: it must not keep JS wrappers alive.
-    std::unordered_map<AibeNativeNode*, AibeNodeWrapper*> node_wrappers;
+    // Weak per-runtime, per-Realm identity cache; it never roots JS wrappers.
+    // Native identity is scoped by Realm: the same host node may have one
+    // wrapper per Realm, but wrappers are never silently reused across Worlds.
+    std::map<std::pair<AibeNativeNode*, uint64_t>, AibeNodeWrapper*> node_wrappers;
     // Weak callbacks only enqueue wrappers; native/V8 handle destruction is
     // deferred until the isolate has left the GC callback phase.
     AibeNodeWrapper* pending_node_releases = nullptr;
 };
 
 namespace {
+constexpr int kAibeRealmEmbedderDataIndex = 1;
+constexpr uint64_t kInvalidRealmId = UINT64_MAX;
+
+uint64_t current_realm_id(v8::Isolate* isolate)
+{
+    auto context = isolate->GetCurrentContext();
+    if (context.IsEmpty()) {
+        return kInvalidRealmId;
+    }
+    auto data = context->GetEmbedderData(kAibeRealmEmbedderDataIndex);
+    if (data.IsEmpty() || !data->IsBigInt()) {
+        return kInvalidRealmId;
+    }
+    bool lossless = false;
+    const auto realm_id = data.As<v8::BigInt>()->Uint64Value(&lossless);
+    return lossless ? realm_id : kInvalidRealmId;
+}
+
 std::atomic<size_t> g_finalized_dom_wrappers{0};
 
 void drain_pending_node_releases(AibeV8Runtime* runtime)
@@ -107,7 +129,9 @@ struct PendingNodeReleaseScope {
     ~PendingNodeReleaseScope() { drain_pending_node_releases(runtime); }
 };
 
-AibeNodeWrapper* node_wrapper_from(v8::Local<v8::Object> object)
+AibeNodeWrapper* node_wrapper_from(
+    v8::Isolate* isolate,
+    v8::Local<v8::Object> object)
 {
     if (object.IsEmpty() || object->InternalFieldCount() != 1) {
         return nullptr;
@@ -116,8 +140,13 @@ AibeNodeWrapper* node_wrapper_from(v8::Local<v8::Object> object)
     if (external.IsEmpty() || !external.As<v8::Value>()->IsExternal()) {
         return nullptr;
     }
-    return static_cast<AibeNodeWrapper*>(
+    auto* wrapper = static_cast<AibeNodeWrapper*>(
         external.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
+    if (wrapper == nullptr || wrapper->owner->isolate != isolate
+        || wrapper->realm_id != current_realm_id(isolate)) {
+        return nullptr;
+    }
+    return wrapper;
 }
 
 void node_wrapper_weak_callback(const v8::WeakCallbackInfo<AibeNodeWrapper>& info)
@@ -125,7 +154,7 @@ void node_wrapper_weak_callback(const v8::WeakCallbackInfo<AibeNodeWrapper>& inf
     auto* wrapper = info.GetParameter();
     wrapper->object.Reset();
     auto* owner = wrapper->owner;
-    owner->node_wrappers.erase(wrapper->node.get());
+    owner->node_wrappers.erase(std::make_pair(wrapper->node.get(), wrapper->realm_id));
     wrapper->pending_next = owner->pending_node_releases;
     owner->pending_node_releases = wrapper;
     g_finalized_dom_wrappers.fetch_add(1, std::memory_order_relaxed);
@@ -136,15 +165,16 @@ void node_wrapper_weak_callback(const v8::WeakCallbackInfo<AibeNodeWrapper>& inf
 AibeNodeWrapper* attach_node_wrapper(
     AibeV8Runtime* runtime,
     v8::Local<v8::Object> object,
-    const std::shared_ptr<AibeNativeNode>& node)
+    const std::shared_ptr<AibeNativeNode>& node,
+    uint64_t realm_id)
 {
     auto* isolate = runtime->isolate;
-    auto* wrapper = new AibeNodeWrapper{runtime, node, {}};
+    auto* wrapper = new AibeNodeWrapper{runtime, node, realm_id, {}};
     object->SetInternalField(
         0, v8::External::New(isolate, wrapper, v8::kExternalPointerTypeTagDefault));
     wrapper->object.Reset(isolate, object);
     wrapper->object.SetWeak(wrapper, node_wrapper_weak_callback, v8::WeakCallbackType::kParameter);
-    runtime->node_wrappers.emplace(wrapper->node.get(), wrapper);
+    runtime->node_wrappers.emplace(std::make_pair(wrapper->node.get(), realm_id), wrapper);
     return wrapper;
 }
 
@@ -152,10 +182,15 @@ AibeNodeWrapper* attach_node_wrapper(
 // Native ownership may outlive a JS wrapper, so re-wrapping is an expected path.
 v8::MaybeLocal<v8::Object> wrap_node(
     AibeV8Runtime* runtime,
-    const std::shared_ptr<AibeNativeNode>& node)
+    const std::shared_ptr<AibeNativeNode>& node,
+    uint64_t realm_id)
 {
     auto* isolate = runtime->isolate;
-    auto found = runtime->node_wrappers.find(node.get());
+    if (current_realm_id(isolate) != realm_id) {
+        return {};
+    }
+    const auto key = std::make_pair(node.get(), realm_id);
+    auto found = runtime->node_wrappers.find(key);
     if (found != runtime->node_wrappers.end()) {
         auto object = found->second->object.Get(isolate);
         if (!object.IsEmpty()) {
@@ -174,7 +209,7 @@ v8::MaybeLocal<v8::Object> wrap_node(
              .ToLocal(&object)) {
         return {};
     }
-    attach_node_wrapper(runtime, object, node);
+    attach_node_wrapper(runtime, object, node, realm_id);
     return object;
 }
 
@@ -182,27 +217,30 @@ void node_constructor(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
     auto* runtime = static_cast<AibeV8Runtime*>(isolate->GetData(0));
-    if (runtime == nullptr || info.This()->InternalFieldCount() != 1) {
+    const auto realm_id = current_realm_id(isolate);
+    if (runtime == nullptr || realm_id == kInvalidRealmId
+        || info.This()->InternalFieldCount() != 1) {
         isolate->ThrowException(v8::Exception::Error(
             v8::String::NewFromUtf8Literal(isolate, "Node constructor is unavailable")));
         return;
     }
 
-    attach_node_wrapper(runtime, info.This(), std::make_shared<AibeNativeNode>());
+    attach_node_wrapper(runtime, info.This(), std::make_shared<AibeNativeNode>(), realm_id);
     info.GetReturnValue().Set(info.This());
 }
 
 void node_append_child(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
-    auto* parent = node_wrapper_from(info.This());
+    auto* parent = node_wrapper_from(isolate, info.This());
     if (parent == nullptr || info.Length() < 1 || !info[0]->IsObject()) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "appendChild requires a Node")));
         return;
     }
-    auto* child = node_wrapper_from(info[0].As<v8::Object>());
-    if (child == nullptr || child->owner != parent->owner) {
+    auto* child = node_wrapper_from(isolate, info[0].As<v8::Object>());
+    if (child == nullptr || child->owner != parent->owner
+        || child->realm_id != parent->realm_id) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "appendChild received an invalid Node")));
         return;
@@ -234,7 +272,7 @@ void node_append_child(const v8::FunctionCallbackInfo<v8::Value>& info)
 void node_add_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
-    auto* wrapper = node_wrapper_from(info.This());
+    auto* wrapper = node_wrapper_from(isolate, info.This());
     if (wrapper == nullptr || info.Length() < 2 || !info[0]->IsString()
         || !info[1]->IsFunction()) {
         isolate->ThrowException(v8::Exception::TypeError(
@@ -278,7 +316,7 @@ void node_add_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
 void node_remove_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
-    auto* wrapper = node_wrapper_from(info.This());
+    auto* wrapper = node_wrapper_from(isolate, info.This());
     if (wrapper == nullptr || info.Length() < 2 || !info[0]->IsString()
         || !info[1]->IsFunction()) {
         isolate->ThrowException(v8::Exception::TypeError(
@@ -312,7 +350,7 @@ void node_remove_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
 void node_dispatch_event(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
-    auto* wrapper = node_wrapper_from(info.This());
+    auto* wrapper = node_wrapper_from(isolate, info.This());
     if (wrapper == nullptr || info.Length() < 1 || !info[0]->IsString()) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "dispatchEvent requires an event type string")));
@@ -363,7 +401,7 @@ void node_dispatch_event(const v8::FunctionCallbackInfo<v8::Value>& info)
 void node_child_count(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
-    auto* wrapper = node_wrapper_from(info.This());
+    auto* wrapper = node_wrapper_from(isolate, info.This());
     if (wrapper == nullptr) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "childCount receiver is not a Node")));
@@ -377,7 +415,7 @@ void node_child_count(const v8::FunctionCallbackInfo<v8::Value>& info)
 void node_first_child(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
-    auto* parent = node_wrapper_from(info.This());
+    auto* parent = node_wrapper_from(isolate, info.This());
     if (parent == nullptr) {
         isolate->ThrowException(v8::Exception::TypeError(
             v8::String::NewFromUtf8Literal(isolate, "firstChild receiver is not a Node")));
@@ -389,7 +427,8 @@ void node_first_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     }
 
     v8::Local<v8::Object> child;
-    if (!wrap_node(parent->owner, parent->node->children.front()).ToLocal(&child)) {
+    if (!wrap_node(
+            parent->owner, parent->node->children.front(), parent->realm_id).ToLocal(&child)) {
         isolate->ThrowException(v8::Exception::Error(
             v8::String::NewFromUtf8Literal(isolate, "unable to create Node wrapper")));
         return;
@@ -397,7 +436,7 @@ void node_first_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     info.GetReturnValue().Set(child);
 }
 
-bool install_node_class(AibeV8Runtime* runtime, v8::Local<v8::Context> context)
+bool initialize_node_template(AibeV8Runtime* runtime)
 {
     auto* isolate = runtime->isolate;
     auto node_template = v8::FunctionTemplate::New(isolate, node_constructor);
@@ -428,6 +467,21 @@ bool install_node_class(AibeV8Runtime* runtime, v8::Local<v8::Context> context)
         isolate,
         "firstChild",
         v8::FunctionTemplate::New(isolate, node_first_child));
+    return true;
+}
+
+bool install_node_class(
+    AibeV8Runtime* runtime,
+    v8::Local<v8::Context> context,
+    uint64_t realm_id)
+{
+    auto* isolate = runtime->isolate;
+    context->SetEmbedderData(
+        kAibeRealmEmbedderDataIndex, v8::BigInt::NewFromUnsigned(isolate, realm_id));
+    auto node_template = runtime->node_template.Get(isolate);
+    if (node_template.IsEmpty()) {
+        return false;
+    }
     v8::Local<v8::Function> constructor;
     if (!node_template->GetFunction(context).ToLocal(&constructor)) {
         return false;
@@ -635,7 +689,8 @@ extern "C" void* aibe_v8_create()
             return nullptr;
         }
         runtime->isolate->SetData(0, runtime.get());
-        if (!install_node_class(runtime.get(), context)) {
+        if (!initialize_node_template(runtime.get())
+            || !install_node_class(runtime.get(), context, 0)) {
             runtime->isolate->Dispose();
             runtime->isolate = nullptr;
             return nullptr;
@@ -920,6 +975,9 @@ extern "C" int aibe_v8_create_realm(void* opaque, uint64_t* realm_id)
         return -10;
     }
     const uint64_t id = runtime->next_realm_id++;
+    if (!install_node_class(runtime, context, id)) {
+        return -8;
+    }
     v8::Global<v8::Context> persistent(runtime->isolate, context);
     runtime->realms.emplace(id, std::move(persistent));
     *realm_id = id;

@@ -194,3 +194,12 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - The narrow C ABI now copies V8 `TryCatch::Message()` text with an explicit byte length and returns line/start-column separately. Missing columns use an explicit sentinel and become `None` in Rust; V8 objects and exception handles do not cross the FFI boundary.
 - Tests verify syntax errors include a message and source location, and runtime exceptions preserve the thrown Error message and the second source line. V8 FFI tests remain 15/15; the full workspace remains 52/52. Formatting and Clippy with `-D warnings` pass.
 - The error model does not yet expose stack traces, structured thrown values, nested causes, or a cross-engine error taxonomy. V8 message/location data may be absent for some abrupt completions; the adapter status remains the stable fallback signal.
+
+## Realm-aware DOM host binding update — 2026-11-01
+
+- Installed the project-owned minimal `Node` host class into each newly created V8 Context, not only the default Context. The shared `FunctionTemplate` produces a context-local constructor/prototype for each Realm.
+- Stored the opaque Realm ID in V8 Context embedder data. Each native wrapper records its owning Realm, and the weak wrapper identity cache is now keyed by `(native Node identity, Realm ID)` rather than only by native Node address.
+- `node_wrapper_from()` now validates the current isolate and Realm before exposing a native Node to host methods. `appendChild` rejects nodes that do not belong to the same Runtime and Realm. Child re-wrapping uses the parent's Realm-specific cache entry.
+- Added tests proving that `Node` is installed in two independent Realms, wrapper identity is stable within each Realm, and JavaScript globals remain isolated. FreeBSD V8 FFI tests: 15/15; full workspace tests: 52/52. `cargo fmt --all -- --check`, Clippy with `-D warnings`, and `git diff --check` passed.
+- Scope limitation: the current PoC does not yet expose one native Node to multiple Realms, so cache separation for the same native identity across two simultaneously live Realms is implemented in the key model but not yet exercised through a cross-Realm host transfer test. Origin/security-token policy, host callbacks crossing Rust/C++ boundaries, Agent/Worker mapping, and Realm teardown stress remain open.
+- This does not migrate the shared_ptr DOM prototype to CppHeap and does not establish production DOM or Renderer isolation.
