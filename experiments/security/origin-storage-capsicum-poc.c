@@ -81,48 +81,113 @@ static int send_origin_storage_fd(int ipc_fd, int storage_fd)
     return 0;
 }
 
+static void close_received_rights(struct msghdr *message)
+{
+    for (struct cmsghdr *header = CMSG_FIRSTHDR(message);
+         header != NULL;
+         header = CMSG_NXTHDR(message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len < CMSG_LEN(0) ||
+            header->cmsg_len > message->msg_controllen) continue;
+        size_t payload_length = header->cmsg_len - CMSG_LEN(0);
+        size_t count = payload_length / sizeof(int);
+        for (size_t i = 0; i < count; i++) {
+            int fd = -1;
+            memcpy(&fd, (char *)CMSG_DATA(header) + i * sizeof(int), sizeof(fd));
+            if (fd >= 0) (void)close(fd);
+        }
+    }
+}
+
 static int receive_origin_storage_fd(int ipc_fd)
 {
     char marker = 0;
     struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
-    char control[CMSG_SPACE(sizeof(int))];
+    char control[CMSG_SPACE(sizeof(int) * 4)];
     memset(control, 0, sizeof(control));
-
     struct msghdr message;
     memset(&message, 0, sizeof(message));
     message.msg_iov = &iov;
     message.msg_iovlen = 1;
     message.msg_control = control;
     message.msg_controllen = sizeof(control);
-
     ssize_t received = recvmsg(ipc_fd, &message, 0);
     if (received != (ssize_t)sizeof(marker) || marker != 'A' ||
         (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+        close_received_rights(&message);
         errno = EPROTO;
         return -1;
     }
-
     struct cmsghdr *header = CMSG_FIRSTHDR(&message);
     if (header == NULL || header->cmsg_level != SOL_SOCKET ||
         header->cmsg_type != SCM_RIGHTS ||
         header->cmsg_len != CMSG_LEN(sizeof(int)) ||
         CMSG_NXTHDR(&message, header) != NULL) {
+        close_received_rights(&message);
         errno = EPROTO;
         return -1;
     }
-
     int received_fd = -1;
     memcpy(&received_fd, CMSG_DATA(header), sizeof(received_fd));
-    if (received_fd != ORIGIN_STORAGE_FD) {
-        if (received_fd >= 0) (void)close(received_fd);
+    if (received_fd < 0 || received_fd != ORIGIN_STORAGE_FD) {
+        close_received_rights(&message);
         errno = EPROTO;
         return -1;
     }
     if (fcntl(received_fd, F_SETFD, FD_CLOEXEC) != 0) {
-        (void)close(received_fd);
+        int saved_errno = errno;
+        close_received_rights(&message);
+        errno = saved_errno;
         return -1;
     }
     return received_fd;
+}
+
+static int test_rejects_multiple_storage_fds(void)
+{
+    int channels[2] = {-1, -1};
+    int sources[2] = {STDIN_FILENO, STDOUT_FILENO};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) return -1;
+    pid_t child = fork();
+    if (child < 0) { (void)close(channels[0]); (void)close(channels[1]); return -1; }
+    if (child == 0) {
+        (void)close(channels[0]);
+        if (dup2(channels[1], RENDERER_IPC_FD) < 0) _exit(EXIT_FAILURE);
+        if (channels[1] != RENDERER_IPC_FD) (void)close(channels[1]);
+        closefrom(RENDERER_IPC_FD + 1);
+        int result = receive_origin_storage_fd(RENDERER_IPC_FD);
+        if (result >= 0) { (void)close(result); _exit(EXIT_FAILURE); }
+        errno = 0;
+        if (fcntl(ORIGIN_STORAGE_FD, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
+        errno = 0;
+        if (fcntl(ORIGIN_STORAGE_FD + 1, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
+        _exit(EXIT_SUCCESS);
+    }
+    (void)close(channels[1]);
+    char marker = 'A';
+    struct iovec iov = { .iov_base = &marker, .iov_len = sizeof(marker) };
+    char control[CMSG_SPACE(sizeof(sources))];
+    memset(control, 0, sizeof(control));
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (header == NULL) { (void)close(channels[0]); (void)waitpid(child, NULL, 0); return -1; }
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(sources));
+    memcpy(CMSG_DATA(header), sources, sizeof(sources));
+    ssize_t sent = sendmsg(channels[0], &message, 0);
+    (void)close(channels[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0 || sent != (ssize_t)sizeof(marker) ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) return -1;
+    (void)puts("PASS: malformed multi-FD SCM_RIGHTS message rejected; all received descriptors closed");
+    (void)fflush(stdout);
+    return 0;
 }
 
 static int renderer_read_origin_a(int inherited_ipc_fd, int inherited_origin_a_fd, int inherited_origin_b_fd)
@@ -235,6 +300,10 @@ int main(void)
         return EXIT_FAILURE;
     }
     root_created = 1;
+    if (test_rejects_multiple_storage_fds() != 0) {
+        (void)fprintf(stderr, "FAIL: malformed SCM_RIGHTS descriptor cleanup test\n");
+        goto cleanup;
+    }
     (void)snprintf(origin_a, sizeof(origin_a), "%s/origin-a", root);
     (void)snprintf(origin_b, sizeof(origin_b), "%s/origin-b", root);
     (void)snprintf(file_a, sizeof(file_a), "%s/secret.txt", origin_a);
