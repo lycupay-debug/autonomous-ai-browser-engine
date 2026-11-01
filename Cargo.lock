@@ -27,6 +27,7 @@ dependencies = [
  "aibe-html-parser-poc",
  "aibe-js-runtime-ffi-poc",
  "aibe-origin-policy-poc",
+ "serde_json",
 ]
 
 [[package]]

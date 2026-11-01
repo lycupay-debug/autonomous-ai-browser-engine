@@ -8,13 +8,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use aibe_html_parser_poc::{HtmlDocument, HtmlParseError, parse_html};
+use aibe_html_parser_poc::{
+    HtmlDocument, HtmlNode, HtmlParseError, HtmlSnapshotError, MAX_DOM_SNAPSHOT_BYTES, NodeId,
+    parse_html,
+};
 use aibe_js_runtime_ffi_poc::{JsRealmId, JsRuntime, JsRuntimeError, JsValue};
 use aibe_origin_policy_poc::OriginGroupId;
 
 use crate::{BrowserRuntimeOriginError, OriginRealmCoordinator, OriginRealmRuntime};
 
 const DEFAULT_MAX_REDIRECTS: usize = 20;
+pub const MAX_DOCUMENT_SNAPSHOT_BYTES: usize = MAX_DOM_SNAPSHOT_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FrameId(u64);
@@ -70,6 +74,17 @@ pub enum NavigationError<E> {
         cleanup: BrowserRuntimeOriginError<E>,
     },
     HtmlParse(HtmlParseError),
+    HtmlSnapshot(HtmlSnapshotError),
+    SnapshotSerialization(String),
+    SnapshotTooLarge {
+        actual: usize,
+        limit: usize,
+    },
+    NoHtmlTree,
+    RevisionExhausted,
+    UnknownNode,
+    StaleNodeHandle,
+    CrossDocumentNodeHandle,
     UnknownFrame,
     UnknownDocument,
     UnknownNavigation,
@@ -95,6 +110,26 @@ impl<E: fmt::Display> fmt::Display for NavigationError<E> {
                 "Document initialization failed ({initialization}); candidate Realm cleanup also failed ({cleanup})"
             ),
             Self::HtmlParse(error) => write!(formatter, "HTML parsing failed: {error}"),
+            Self::HtmlSnapshot(error) => write!(formatter, "HTML snapshot failed: {error}"),
+            Self::SnapshotSerialization(error) => write!(
+                formatter,
+                "Document snapshot envelope serialization failed: {error}"
+            ),
+            Self::SnapshotTooLarge { actual, limit } => write!(
+                formatter,
+                "Document snapshot is {actual} bytes; limit is {limit}"
+            ),
+            Self::NoHtmlTree => formatter.write_str("Document has no parsed HTML tree"),
+            Self::RevisionExhausted => {
+                formatter.write_str("Document HTML revision space exhausted")
+            }
+            Self::UnknownNode => formatter.write_str("Node ID does not exist in this Document"),
+            Self::StaleNodeHandle => {
+                formatter.write_str("Node handle belongs to an obsolete Document revision")
+            }
+            Self::CrossDocumentNodeHandle => {
+                formatter.write_str("Node handle belongs to a different Document")
+            }
             Self::UnknownFrame => formatter.write_str("unknown Frame"),
             Self::UnknownDocument => formatter.write_str("unknown Document"),
             Self::UnknownNavigation => formatter.write_str("unknown Navigation"),
@@ -131,6 +166,33 @@ impl<E> From<HtmlParseError> for NavigationError<E> {
     }
 }
 
+impl<E> From<HtmlSnapshotError> for NavigationError<E> {
+    fn from(error: HtmlSnapshotError) -> Self {
+        Self::HtmlSnapshot(error)
+    }
+}
+
+/// Host-issued handle scoped to one Document generation and HTML revision.
+/// The parser-local NodeId alone is never sufficient to address a live node.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DocumentNodeHandle {
+    document_id: DocumentId,
+    revision: u64,
+    node_id: NodeId,
+}
+
+impl DocumentNodeHandle {
+    pub const fn document_id(self) -> DocumentId {
+        self.document_id
+    }
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+    pub const fn node_id(self) -> NodeId {
+        self.node_id
+    }
+}
+
 pub struct Document<R: OriginRealmRuntime> {
     id: DocumentId,
     frame: FrameId,
@@ -138,6 +200,7 @@ pub struct Document<R: OriginRealmRuntime> {
     origin: OriginGroupId,
     realm: R::Realm,
     html_document: Option<HtmlDocument>,
+    html_revision: u64,
 }
 
 impl<R: OriginRealmRuntime> Document<R> {
@@ -158,6 +221,10 @@ impl<R: OriginRealmRuntime> Document<R> {
     }
     pub fn html_document(&self) -> Option<&HtmlDocument> {
         self.html_document.as_ref()
+    }
+    /// Monotonically increases whenever this Document's parsed HTML tree is replaced.
+    pub const fn html_revision(&self) -> u64 {
+        self.html_revision
     }
 }
 
@@ -229,7 +296,8 @@ impl<R: OriginRealmRuntime> DedicatedWorker<R> {
 }
 
 /// Owns Frame/Document/Navigation references and delegates Realm lifetime to
-/// `OriginRealmCoordinator`. No network, parser, layout, or Worker is included.
+/// `OriginRealmCoordinator`. Bounded HTML parsing and immutable snapshot export
+/// are explicit host operations; network loading, layout and live DOM are absent.
 pub struct NavigationController<R: OriginRealmRuntime> {
     coordinator: OriginRealmCoordinator<R>,
     frames: HashMap<FrameId, Frame>,
@@ -321,6 +389,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
                 origin,
                 realm,
                 html_document: None,
+                html_revision: 0,
             },
         );
         Ok(frame)
@@ -381,6 +450,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
                 origin,
                 realm,
                 html_document: None,
+                html_revision: 0,
             },
         );
         Ok(frame)
@@ -466,11 +536,104 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             return Err(NavigationError::UnknownDocument);
         }
         let parsed = parse_html(body)?;
-        self.documents
+        let current = self
+            .documents
             .get_mut(&document)
-            .expect("validated Document remains present")
-            .html_document = Some(parsed);
+            .expect("validated Document remains present");
+        let next_revision = current
+            .html_revision
+            .checked_add(1)
+            .ok_or(NavigationError::RevisionExhausted)?;
+        current.html_document = Some(parsed);
+        current.html_revision = next_revision;
         Ok(())
+    }
+
+    /// Issues a host-side node handle only for a Node in the current tree.
+    pub fn node_handle(
+        &self,
+        document: DocumentId,
+        node_id: NodeId,
+    ) -> Result<DocumentNodeHandle, NavigationError<R::Error>> {
+        let current = self
+            .documents
+            .get(&document)
+            .ok_or(NavigationError::UnknownDocument)?;
+        let html = current
+            .html_document
+            .as_ref()
+            .ok_or(NavigationError::NoHtmlTree)?;
+        if html.node(node_id).is_none() {
+            return Err(NavigationError::UnknownNode);
+        }
+        Ok(DocumentNodeHandle {
+            document_id: document,
+            revision: current.html_revision,
+            node_id,
+        })
+    }
+
+    /// Resolves a handle only when both its Document identity and revision match.
+    /// This prevents stale indices from being reused after reparsing and prevents
+    /// a handle from one Document being applied in another Document's context.
+    pub fn resolve_node_handle(
+        &self,
+        expected_document: DocumentId,
+        handle: DocumentNodeHandle,
+    ) -> Result<&HtmlNode, NavigationError<R::Error>> {
+        if handle.document_id != expected_document {
+            return Err(NavigationError::CrossDocumentNodeHandle);
+        }
+        let current = self
+            .documents
+            .get(&expected_document)
+            .ok_or(NavigationError::UnknownDocument)?;
+        if current.html_revision != handle.revision {
+            return Err(NavigationError::StaleNodeHandle);
+        }
+        current
+            .html_document
+            .as_ref()
+            .ok_or(NavigationError::NoHtmlTree)?
+            .node(handle.node_id)
+            .ok_or(NavigationError::UnknownNode)
+    }
+
+    /// Produces a versioned envelope that binds parser-local Node IDs to this
+    /// host Document ID and monotonically increasing HTML revision. Consumers
+    /// must reject handles from any other Document or revision.
+    pub fn document_snapshot_json(
+        &self,
+        document: DocumentId,
+    ) -> Result<Vec<u8>, NavigationError<R::Error>> {
+        let document = self
+            .documents
+            .get(&document)
+            .ok_or(NavigationError::UnknownDocument)?;
+        let html = document
+            .html_document
+            .as_ref()
+            .ok_or(NavigationError::NoHtmlTree)?;
+        let tree_bytes = html.to_snapshot_json()?;
+        let tree: serde_json::Value = serde_json::from_slice(&tree_bytes)
+            .map_err(|error| NavigationError::SnapshotSerialization(error.to_string()))?;
+        let envelope = serde_json::json!({
+            "envelopeVersion": 1,
+            // Decimal strings preserve the full u64 identity/revision range in
+            // JSON consumers whose native Number type is only 53-bit exact.
+            "documentId": document.id.value().to_string(),
+            "revision": document.html_revision.to_string(),
+            "tree": tree,
+        });
+        let encoded = serde_json::to_vec(&envelope)
+            .map_err(|error| NavigationError::SnapshotSerialization(error.to_string()))?;
+        if encoded.len() > MAX_DOCUMENT_SNAPSHOT_BYTES {
+            return Err(NavigationError::SnapshotTooLarge {
+                actual: encoded.len(),
+                limit: MAX_DOCUMENT_SNAPSHOT_BYTES,
+            });
+        }
+        Ok(encoded)
     }
 
     /// Parses a candidate response before performing any destructive commit
@@ -483,10 +646,12 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
     ) -> Result<DocumentId, NavigationError<R::Error>> {
         let parsed = parse_html(body)?;
         let document = self.commit_navigation(navigation)?;
-        self.documents
+        let committed = self
+            .documents
             .get_mut(&document)
-            .expect("committed Document remains present")
-            .html_document = Some(parsed);
+            .expect("committed Document remains present");
+        committed.html_document = Some(parsed);
+        committed.html_revision = 1;
         Ok(document)
     }
 
@@ -573,6 +738,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
                 origin: candidate.target_origin,
                 realm: candidate.target_realm,
                 html_document: None,
+                html_revision: 0,
             },
         );
         let frame = self
