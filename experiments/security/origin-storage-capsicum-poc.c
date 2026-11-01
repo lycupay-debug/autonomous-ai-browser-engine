@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,8 +27,10 @@
 #define GRANT_PROTOCOL_VERSION UINT16_C(1)
 #define ORIGIN_GROUP_A UINT64_C(0xA1)
 #define ORIGIN_GROUP_B UINT64_C(0xB1)
+#define RENDERER_INSTANCE_ID UINT64_C(0x5001)
+#define GRANT_REGISTRY_ID UINT64_C(0x2001)
 #define STORAGE_GRANT_ID UINT64_C(0x1001)
-#define STORAGE_RIGHT_READ UINT32_C(0x01)
+#define STORAGE_RIGHTS_READ_ONLY UINT32_C(0x07)
 
 /* Local Broker/Renderer ABI; SOCK_SEQPACKET preserves this envelope as one record. */
 struct storage_grant_header {
@@ -36,21 +39,34 @@ struct storage_grant_header {
     uint16_t descriptor_count;
     uint32_t renderer_pid;
     uint32_t rights;
+    uint64_t renderer_instance_id;
+    uint64_t registry_id;
     uint64_t grant_id;
     uint64_t origin_group_id;
 };
 
-_Static_assert(sizeof(struct storage_grant_header) == 32, "storage grant header ABI size changed");
+_Static_assert(sizeof(struct storage_grant_header) == 48, "storage grant header ABI size changed");
+_Static_assert(offsetof(struct storage_grant_header, renderer_instance_id) == 16, "renderer instance ABI offset changed");
+_Static_assert(offsetof(struct storage_grant_header, registry_id) == 24, "registry ABI offset changed");
+_Static_assert(offsetof(struct storage_grant_header, grant_id) == 32, "grant sequence ABI offset changed");
+_Static_assert(offsetof(struct storage_grant_header, origin_group_id) == 40, "origin group ABI offset changed");
 
-static struct storage_grant_header make_storage_grant(pid_t renderer_pid, uint64_t origin_group_id)
+static struct storage_grant_header make_storage_grant(
+    pid_t renderer_pid,
+    uint64_t renderer_instance_id,
+    uint64_t registry_id,
+    uint64_t grant_id,
+    uint64_t origin_group_id)
 {
     return (struct storage_grant_header) {
         .magic = GRANT_MAGIC,
         .version = GRANT_PROTOCOL_VERSION,
         .descriptor_count = 1,
         .renderer_pid = (uint32_t)renderer_pid,
-        .rights = STORAGE_RIGHT_READ,
-        .grant_id = STORAGE_GRANT_ID,
+        .rights = STORAGE_RIGHTS_READ_ONLY,
+        .renderer_instance_id = renderer_instance_id,
+        .registry_id = registry_id,
+        .grant_id = grant_id,
         .origin_group_id = origin_group_id,
     };
 }
@@ -153,6 +169,8 @@ static void close_received_rights(struct msghdr *message)
 static int receive_origin_storage_fd(
     int ipc_fd,
     pid_t expected_renderer_pid,
+    uint64_t expected_renderer_instance_id,
+    uint64_t expected_registry_id,
     uint64_t expected_origin_group_id,
     uint64_t expected_grant_id)
 {
@@ -174,7 +192,9 @@ static int receive_origin_storage_fd(
         grant.version != GRANT_PROTOCOL_VERSION ||
         grant.descriptor_count != 1 ||
         grant.renderer_pid != (uint32_t)expected_renderer_pid ||
-        grant.rights != STORAGE_RIGHT_READ ||
+        grant.rights != STORAGE_RIGHTS_READ_ONLY ||
+        grant.renderer_instance_id != expected_renderer_instance_id ||
+        grant.registry_id != expected_registry_id ||
         grant.grant_id != expected_grant_id ||
         grant.origin_group_id != expected_origin_group_id) {
         close_received_rights(&message);
@@ -219,7 +239,8 @@ static int test_rejects_multiple_storage_fds(void)
         if (channels[1] != RENDERER_IPC_FD) (void)close(channels[1]);
         closefrom(RENDERER_IPC_FD + 1);
         int result = receive_origin_storage_fd(
-            RENDERER_IPC_FD, getpid(), ORIGIN_GROUP_A, STORAGE_GRANT_ID);
+            RENDERER_IPC_FD, getpid(), RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID,
+            ORIGIN_GROUP_A, STORAGE_GRANT_ID);
         if (result >= 0) { (void)close(result); _exit(EXIT_FAILURE); }
         errno = 0;
         if (fcntl(ORIGIN_STORAGE_FD, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
@@ -228,7 +249,8 @@ static int test_rejects_multiple_storage_fds(void)
         _exit(EXIT_SUCCESS);
     }
     (void)close(channels[1]);
-    struct storage_grant_header grant = make_storage_grant(child, ORIGIN_GROUP_A);
+    struct storage_grant_header grant = make_storage_grant(
+        child, RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID, STORAGE_GRANT_ID, ORIGIN_GROUP_A);
     struct iovec iov = { .iov_base = &grant, .iov_len = sizeof(grant) };
     char control[CMSG_SPACE(sizeof(sources))];
     memset(control, 0, sizeof(control));
@@ -257,6 +279,8 @@ static int test_rejects_multiple_storage_fds(void)
 static int test_rejects_invalid_grant_and_closes_fd(
     uint64_t supplied_origin_group_id,
     pid_t renderer_pid_delta,
+    uint64_t supplied_renderer_instance_id,
+    uint64_t supplied_registry_id,
     const char *case_name)
 {
     int channels[2] = {-1, -1};
@@ -270,7 +294,8 @@ static int test_rejects_invalid_grant_and_closes_fd(
         if (channels[1] != RENDERER_IPC_FD) (void)close(channels[1]);
         closefrom(RENDERER_IPC_FD + 1);
         int result = receive_origin_storage_fd(
-            RENDERER_IPC_FD, getpid(), ORIGIN_GROUP_A, STORAGE_GRANT_ID);
+            RENDERER_IPC_FD, getpid(), RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID,
+            ORIGIN_GROUP_A, STORAGE_GRANT_ID);
         if (result >= 0) { (void)close(result); _exit(EXIT_FAILURE); }
         errno = 0;
         if (fcntl(ORIGIN_STORAGE_FD, F_GETFD) != -1 || errno != EBADF) _exit(EXIT_FAILURE);
@@ -278,7 +303,8 @@ static int test_rejects_invalid_grant_and_closes_fd(
     }
     (void)close(channels[1]);
     struct storage_grant_header grant = make_storage_grant(
-        child + renderer_pid_delta, supplied_origin_group_id);
+        child + renderer_pid_delta, supplied_renderer_instance_id, supplied_registry_id,
+        STORAGE_GRANT_ID, supplied_origin_group_id);
     struct iovec iov = { .iov_base = &grant, .iov_len = sizeof(grant) };
     char control[CMSG_SPACE(sizeof(source_fd))];
     memset(control, 0, sizeof(control));
@@ -323,7 +349,8 @@ static int renderer_read_origin_a(int inherited_ipc_fd, int inherited_origin_a_f
     if (limit_standard_descriptors() != 0) return EXIT_FAILURE;
 
     int storage_fd = receive_origin_storage_fd(
-        RENDERER_IPC_FD, getpid(), ORIGIN_GROUP_A, STORAGE_GRANT_ID);
+        RENDERER_IPC_FD, getpid(), RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID,
+        ORIGIN_GROUP_A, STORAGE_GRANT_ID);
     if (storage_fd < 0) {
         perror("renderer receive Origin A storage FD");
         return EXIT_FAILURE;
@@ -440,12 +467,26 @@ int main(void)
         (void)fprintf(stderr, "FAIL: malformed SCM_RIGHTS descriptor cleanup test\n");
         goto cleanup;
     }
-    if (test_rejects_invalid_grant_and_closes_fd(ORIGIN_GROUP_B, 0, "origin") != 0) {
+    if (test_rejects_invalid_grant_and_closes_fd(
+            ORIGIN_GROUP_B, 0, RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID, "origin") != 0) {
         (void)fprintf(stderr, "FAIL: wrong-origin storage grant cleanup test\n");
         goto cleanup;
     }
-    if (test_rejects_invalid_grant_and_closes_fd(ORIGIN_GROUP_A, 1, "renderer PID") != 0) {
+    if (test_rejects_invalid_grant_and_closes_fd(
+            ORIGIN_GROUP_A, 1, RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID, "renderer PID") != 0) {
         (void)fprintf(stderr, "FAIL: wrong-renderer-PID storage grant cleanup test\n");
+        goto cleanup;
+    }
+    if (test_rejects_invalid_grant_and_closes_fd(
+            ORIGIN_GROUP_A, 0, RENDERER_INSTANCE_ID + 1, GRANT_REGISTRY_ID,
+            "renderer instance ID") != 0) {
+        (void)fprintf(stderr, "FAIL: wrong-renderer-instance storage grant cleanup test\n");
+        goto cleanup;
+    }
+    if (test_rejects_invalid_grant_and_closes_fd(
+            ORIGIN_GROUP_A, 0, RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID + 1,
+            "grant registry ID") != 0) {
+        (void)fprintf(stderr, "FAIL: wrong-registry storage grant cleanup test\n");
         goto cleanup;
     }
     (void)snprintf(origin_a, sizeof(origin_a), "%s/origin-a", root);
@@ -486,7 +527,8 @@ int main(void)
         perror("authorize renderer peer before storage grant");
         goto cleanup;
     }
-    struct storage_grant_header grant = make_storage_grant(child, ORIGIN_GROUP_A);
+    struct storage_grant_header grant = make_storage_grant(
+        child, RENDERER_INSTANCE_ID, GRANT_REGISTRY_ID, STORAGE_GRANT_ID, ORIGIN_GROUP_A);
     if (send_origin_storage_fd(channels[0], origin_a_fd, &grant) != 0) {
         perror("broker send Origin A storage FD");
         goto cleanup;
@@ -530,7 +572,7 @@ int main(void)
         goto cleanup;
     }
 
-    (void)puts("PASS: broker authenticated peer UID/GID and transferred one PID/Origin-scoped storage capability");
+    (void)puts("PASS: broker authenticated peer UID/GID and transferred one Renderer-instance/registry/Origin-scoped storage capability");
     (void)puts("PASS: broker-local FD close does not revoke renderer copy; terminating renderer revokes process-held capability");
     result = EXIT_SUCCESS;
 

@@ -372,7 +372,7 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 
 ### Design and implementation
 
-- Replaced the one-byte storage marker with a fixed-size 32-byte local grant envelope: magic, protocol version, descriptor count, broker-tracked Renderer PID, rights mask, grant ID, and host-issued Origin Group ID.
+- Replaced the one-byte storage marker with a fixed-size 48-byte host-local C ABI grant envelope: magic, protocol version, descriptor count, broker-tracked Renderer PID, read-only rights mask, Renderer instance ID, registry ID, grant sequence, and host-issued Origin Group ID.
 - Changed this PoC's Broker/Renderer channel from `SOCK_STREAM` to `SOCK_SEQPACKET`, so the grant header and its `SCM_RIGHTS` ancillary descriptor are received as one bounded record rather than relying on stream read boundaries.
 - Broker still obtains kernel-reported peer effective UID/GID with `getpeereid()` and requires exact equality with the local policy before sending the descriptor.
 - Renderer validates protocol version, magic, exactly-one-descriptor declaration, expected child PID, read-only grant mask, grant ID, and expected Origin Group before accepting the descriptor. It then applies `CAP_LOOKUP | CAP_READ | CAP_FSTAT` and enters Capsicum capability mode.
@@ -414,7 +414,7 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 
 ### Verification
 
-- Broker policy crate: 12/12 tests passed on FreeBSD 15.1.
+- Broker policy crate: 13/13 tests passed on FreeBSD 15.1, including C ABI size/offset parity checks for the 48-byte grant envelope.
 - Tests cover read-only grant binding, one-shot/replay behavior, same-PID/new-instance rejection, Origin mismatch, rights escalation, unsupported rights, per-Renderer quota, global quota, two-phase delegated-grant revocation, process-exit cleanup, registry-scoped grant IDs, and invalid quota/identity values.
 - SBOM generation/validation inventory updated from seven to eight workspace crates. Local SBOM generator availability remains subject to the CI supply-chain job; do not claim local artifact generation unless run.
 

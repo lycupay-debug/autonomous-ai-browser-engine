@@ -90,6 +90,28 @@ impl GrantId {
     }
 }
 
+pub const GRANT_WIRE_MAGIC: u32 = 0x4149_4245;
+pub const GRANT_WIRE_VERSION: u16 = 1;
+pub const GRANT_WIRE_DESCRIPTOR_COUNT: u16 = 1;
+
+/// Fixed host-local C ABI mirrored by `origin-storage-capsicum-poc.c`.
+/// This is not a network serialization format; peers must share the same ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrantWireHeader {
+    pub magic: u32,
+    pub version: u16,
+    pub descriptor_count: u16,
+    pub renderer_pid: u32,
+    pub rights: u32,
+    pub renderer_instance_id: u64,
+    pub registry_id: u64,
+    pub grant_sequence: u64,
+    pub origin_group_id: u64,
+}
+
+const _: [(); 48] = [(); std::mem::size_of::<GrantWireHeader>()];
+
 /// Capability subset supported by this prototype. Storage grants are
 /// intentionally read-only; write/create rights are not currently grantable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +188,20 @@ impl GrantPermit {
 
     pub const fn rights(self) -> StorageRights {
         self.rights
+    }
+
+    pub const fn wire_header(self) -> GrantWireHeader {
+        GrantWireHeader {
+            magic: GRANT_WIRE_MAGIC,
+            version: GRANT_WIRE_VERSION,
+            descriptor_count: GRANT_WIRE_DESCRIPTOR_COUNT,
+            renderer_pid: self.renderer.pid,
+            rights: self.rights.bits() as u32,
+            renderer_instance_id: self.renderer.id.value(),
+            registry_id: self.id.registry_id,
+            grant_sequence: self.id.sequence,
+            origin_group_id: self.origin.value(),
+        }
     }
 }
 
@@ -361,7 +397,8 @@ impl GrantRegistry {
 #[cfg(test)]
 mod tests {
     use super::{
-        GrantError, GrantRegistry, GrantState, OriginGroupId, RendererId, RendererPrincipal,
+        GRANT_WIRE_DESCRIPTOR_COUNT, GRANT_WIRE_MAGIC, GRANT_WIRE_VERSION, GrantError,
+        GrantRegistry, GrantState, GrantWireHeader, OriginGroupId, RendererId, RendererPrincipal,
         RevocationOutcome, StorageRights,
     };
 
@@ -391,6 +428,36 @@ mod tests {
         assert_eq!(permit.origin(), origin(10));
         assert_eq!(permit.rights(), StorageRights::READ_ONLY);
         assert_eq!(registry.state_of(grant), Some(GrantState::Delegated));
+    }
+
+    #[test]
+    fn grant_wire_header_matches_the_c_abi_layout() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<GrantWireHeader>(), 48);
+        assert_eq!(offset_of!(GrantWireHeader, renderer_instance_id), 16);
+        assert_eq!(offset_of!(GrantWireHeader, registry_id), 24);
+        assert_eq!(offset_of!(GrantWireHeader, grant_sequence), 32);
+        assert_eq!(offset_of!(GrantWireHeader, origin_group_id), 40);
+
+        let mut registry = registry();
+        let owner = renderer(0x5001, 4101);
+        let grant = registry
+            .issue(owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let permit = registry
+            .authorize_transfer(grant, owner, origin(10), StorageRights::READ_ONLY)
+            .unwrap();
+        let header = permit.wire_header();
+        assert_eq!(header.magic, GRANT_WIRE_MAGIC);
+        assert_eq!(header.version, GRANT_WIRE_VERSION);
+        assert_eq!(header.descriptor_count, GRANT_WIRE_DESCRIPTOR_COUNT);
+        assert_eq!(header.renderer_pid, owner.pid());
+        assert_eq!(header.rights, StorageRights::READ_ONLY.bits() as u32);
+        assert_eq!(header.renderer_instance_id, owner.id().value());
+        assert_eq!(header.registry_id, grant.registry_id());
+        assert_eq!(header.grant_sequence, grant.value());
+        assert_eq!(header.origin_group_id, origin(10).value());
     }
 
     #[test]
