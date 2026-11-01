@@ -16,7 +16,7 @@ The current V8 FFI PoC models host-issued origin groups separately from JavaScri
 - No Playwright runtime, Chromium, or Servo as the final execution core.
 - Headless-first; headed mode is retained as a later backend.
 - AI has broad browser-level control, while host access and dangerous operations remain policy-gated.
-- Security threat modeling and negative tests start in Phase 0 and continue throughout development.
+- Security threat modeling and negative tests start in Phase 0 and continue throughout development. The accepted Renderer isolation direction is one dedicated FreeBSD Jail per Renderer; see `docs/adr/0002-renderer-isolation-one-jail-per-renderer.md`.
 - No compatibility claims without pinned WPT/Test262 versions and published results.
 
 ## Repository layout
@@ -28,7 +28,7 @@ The current V8 FFI PoC models host-issued origin groups separately from JavaScri
 - `experiments/browser-runtime/`: orchestration PoC mapping canonical origin groups to JS Runtime origin handles, Document/Frame/Worker lifetimes, minimal Document host initialization, Document-scoped script evaluation and ownership of parsed HTML trees.
 - `experiments/html-parser/`: html5ever-backed HTML5 parsing PoC with a project-owned bounded DOM node arena.
 - `experiments/js-runtime/benchmarks/`: common cross-runtime JavaScript microbenchmark.
-- `experiments/security/`: FreeBSD Capsicum, per-origin storage descriptor, crash-recovery, peer-credential and Jail network-isolation PoCs.
+- `experiments/security/`: FreeBSD Capsicum, per-origin storage descriptor, crash-recovery, peer-credential, Jail network-isolation and one-Renderer/one-Jail lifecycle PoCs.
 - `experiments/headless/raster-poc/`: OpenType shaping, CPU glyph rasterization and PNG/JPEG/GIF/WebP decode PoC.
 - `experiments/network-policy/`: outbound IP policy, pinned TCP/TLS, SNI/certificate verification and per-redirect revalidation PoC.
 - `docs/adr/`: accepted architecture decision records.

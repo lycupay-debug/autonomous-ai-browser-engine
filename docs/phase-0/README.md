@@ -664,3 +664,47 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 3. 将 generic Node metadata 迁移到 typed native node storage，补充属性、文本、Document/Element 语义和 live mutation。
 4. 研究 Renderer 的真实 sandbox 配置：descriptor close-on-exec、Capsicum rights、Jail/resource limits、独立身份与 network broker；先在隔离实验中验证，不修改主机持久配置。
 5. 完成 Snapshot / Renderer 生命周期与 Navigation Document teardown 的自动联动，再评估阶段 0 退出条件。
+
+
+## Incremental R&D record｜2026-11-02（One Renderer per Jail lifecycle / identity / RCTL）
+
+### 架构决策
+
+- 项目负责人确认采用 **每个 Renderer 一个独立 FreeBSD Jail**。Supervisor 留在宿主机可信边界内，负责 Renderer 生命周期、Broker IPC、身份登记、权限授权和回收。
+- 新增 ADR：`docs/adr/0002-renderer-isolation-one-jail-per-renderer.md`，状态 Accepted。FreeBSD 是当前原生目标；本决策不代表已经实现跨平台 Sandbox Provider。
+- 生产配置禁止使用 `path=/`；每个 Renderer 必须有独立 rootfs。默认禁用 Jail 内 IPv4/IPv6 直连，网络访问经独立 Network Service/Broker 授权。
+- `jail(8)` launcher PID 与 Jail 内 Renderer PID 不相同；身份登记必须用内核 `LOCAL_PEERCRED` 取得实际 peer PID/UID/GID，并进一步核对该 PID 的内核 Jail ID，不能把 launcher PID 当作 Renderer PID。
+
+### 新增实现
+
+- 新增 `experiments/security/renderer-jail-lifecycle-poc.c` 和 `scripts/run-renderer-jail-lifecycle-poc.sh`，并接入 `scripts/run-security-pocs.sh`。
+- PoC 为每次运行创建独立临时 rootfs，仅放入静态测试 Renderer、独立 `/run` IPC 目录和临时目录；未把宿主根目录映射进 Jail。
+- 宿主 Broker 在该 rootfs 内创建 UDS endpoint，将 socket owner 设置为 `nobody:nobody`、mode 0600；Jail 内 Renderer 以 UID/GID 65534 连接。监听 FD 设置 `FD_CLOEXEC`，子进程在连接前扫描 FD 3–1023，确认没有宿主监听 FD 或其他非预期描述符被继承。宿主通过 `LOCAL_PEERCRED` 读取 peer PID/UID/GID，再用 `KERN_PROC_PID` 读取该 PID 的内核 `ki_jid` / `ki_uid`，并与当前 Jail JID 对比。
+- 创建仅作用于该 Jail 的临时 RCTL 规则 `vmemoryuse:deny=128M/jail` 与 `maxproc:deny=2/jail`；256 MiB 映射返回 `ENOMEM`，在 Jail 内已有一个 Renderer 时第二次 fork 被内核以 `EAGAIN` 拒绝。使用 `rctl -hu jail:<name>` 读取该 Jail 的运行时资源快照。
+- PoC 宿主控制器通过 `jail -r` 销毁 Jail；验证实际测试 Renderer PID 随 Jail 销毁退出。正常结束和错误清理均删除临时 rootfs、UDS、Jail 与 RCTL 规则。
+
+### FreeBSD 15.1-RELEASE-p6 验证
+
+- 单次生命周期测试通过：kernel peer PID/UID/GID 与实际进程一致；内核进程表报告该 PID 属于目标非零 Jail ID；UID/GID 为 65534；宿主专用 marker 在 Jail rootfs 内不可见。
+- Jail-scoped `vmemoryuse` 负向测试通过：128 MiB 上限拒绝 256 MiB 匿名映射。
+- Jail-scoped `maxproc` 负向测试通过：`maxproc=2/jail` 允许 Renderer 创建第一个子进程，但拒绝第二个 fork，返回 `EAGAIN`；测试清理第一个子进程后再销毁 Jail。
+- Jail 销毁后实际测试 Renderer PID 已不存在；`jls` 无残留 Jail，`rctl` 无残留规则，临时 rootfs 无残留。
+- UDS listener 的 `FD_CLOEXEC` 与子进程 FD 扫描通过；这是最小继承验证，不等于完整生产 FD allowlist。
+- 最新实现连续运行 10 次通过；5 轮双实例并发（共 10 个独立 Renderer Jail）全部通过，未发生 Jail 名称、UDS、RCTL 规则或 rootfs 交叉污染。
+- 完整 `scripts/run-security-pocs.sh`：通过，包括 Capsicum FD rights、Broker/Renderer IPC、UDS peer credentials、per-Origin storage、SCM_RIGHTS malformed-FD cleanup、Renderer crash recovery、Jail IPv4 isolation 和单 Renderer Jail lifecycle/identity/RCTL。
+- 完整 Rust Workspace：**186/186 passed**；Rustfmt、Workspace Clippy（`-D warnings`）和 `git diff --check` 通过。V8 SDK 测试环境要求 `AIBE_RUNTIME_PREFIX` 保持 unset，`LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib`。
+
+### 结论与未完成边界
+
+- **已验证：** FreeBSD Jail 可作为单 Renderer 的进程、文件系统和网络隔离单元；内核 peer 身份可以关联到精确 Jail；Jail 级 RCTL 生效；宿主监听 FD 不会经 exec 继承给 Renderer；销毁 Jail 可终止该测试进程。
+- **当前仍是独立安全 PoC：** 尚未将 Jail launcher 接入 Rust `RendererSupervisor::spawn()` / `terminate()` / `poll_exits()`；尚未将真实 V8 Renderer runtime、动态库、字体与资源文件打包进专用 rootfs。
+- 尚未验证 Jail + Capsicum 的组合顺序、完整 Renderer FD inheritance allowlist、Broker UDS 的生产挂载/路径策略、SCM_RIGHTS 统一授权、网络 Broker 的真实出站路径、Renderer 后代进程持续监督，以及 10/50/100 Renderer 的资源和启动开销。
+- 本次 128 MiB / 2 processes 是负向测试阈值，不是生产内存或进程预算；尚未为 Renderer 配置持久 RCTL 规则。GSM、PostgreSQL、root 用户和全局范围均未添加规则。
+- 未创建持久系统账户、未修改 `/etc/jail.conf`、`/etc/rc.conf`、`/etc/rctl.conf`、`/boot/loader.conf`；未重启主机或任何服务；未部署生产 Renderer。
+
+### 下一子阶段
+
+1. 在 Rust Renderer Supervisor 中实现 FreeBSD Jail launcher adapter：独立 rootfs、唯一 Jail 名称、低权限 UID/GID、Broker UDS path、内核 PID/JID 验证、Jail teardown 与 grant cleanup。
+2. 定义真实 Renderer runtime rootfs 组装策略，确保系统运行库只读、每个 Renderer 的 `/tmp` 与 `/run` 独立，且不向 Jail 暴露宿主敏感目录。
+3. 将 Capsicum FD rights / close-on-exec allowlist 与 Jail IPC 组合，完成正向及负向测试。
+4. 在实际 V8 Renderer 负载下采集资源峰值，再制定每 Jail 的 RCTL 限额；GSM 与 PostgreSQL 始终保持在限制范围之外。
