@@ -6,7 +6,7 @@
 //! resolve/validate/pinned-connect cycle. This is still a narrow HTTPS PoC, not
 //! a complete Fetch implementation or a production network broker.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -24,6 +24,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECTS: usize = 5;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CHUNK_COUNT: usize = 4096;
+const MAX_CHUNK_FRAMING_BYTES: usize = 1024 * 1024;
 
 fn networks(cache: &'static OnceLock<Vec<IpNet>>, cidrs: &[&str]) -> &'static [IpNet] {
     cache
@@ -145,6 +148,8 @@ pub enum FetchError {
     RedirectLimit,
     RedirectDowngrade,
     InvalidRedirect(String),
+    BodyTooLarge { limit: usize },
+    UnsupportedBodyEncoding(String),
     CaBundle(String),
 }
 
@@ -165,10 +170,20 @@ pub struct FetchHeadersResult {
     pub connected_peer: SocketAddr,
 }
 
+/// Bounded HTTPS GET result. `metadata` preserves the redirect chain and the
+/// exact connected peer; `body` is decoded from HTTP transfer framing only.
+/// Content-Encoding compression is deliberately unsupported in this PoC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchResult {
+    pub metadata: FetchHeadersResult,
+    pub body: Vec<u8>,
+}
+
 struct FetchHopResult {
     status: u16,
     headers: Vec<(String, String)>,
     connected_peer: SocketAddr,
+    body: Vec<u8>,
 }
 
 fn load_root_store(ca_bundle: &Path) -> Result<RootCertStore, FetchError> {
@@ -349,6 +364,208 @@ fn read_response_headers<R: BufRead>(
     Ok((status, headers))
 }
 
+fn single_header_value<'a>(
+    headers: &'a [(String, String)],
+    name: &str,
+) -> Result<Option<&'a str>, FetchError> {
+    let mut values = headers
+        .iter()
+        .filter(|(header_name, _)| header_name == name)
+        .map(|(_, value)| value.as_str());
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(FetchError::InvalidResponse(format!(
+            "duplicate {name} header is unsupported"
+        )));
+    }
+    Ok(first)
+}
+
+fn validate_trailer_line(line: &str) -> Result<(), FetchError> {
+    let (name, value) = line
+        .strip_suffix("\r\n")
+        .and_then(|line| line.split_once(':'))
+        .ok_or_else(|| FetchError::InvalidResponse("malformed HTTP trailer".into()))?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    {
+        return Err(FetchError::InvalidResponse(
+            "invalid HTTP trailer name".into(),
+        ));
+    }
+    if value
+        .bytes()
+        .any(|byte| byte == b'\0' || (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+    {
+        return Err(FetchError::InvalidResponse(
+            "HTTP trailer value contains a control character".into(),
+        ));
+    }
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length" | "transfer-encoding" | "host" | "trailer"
+    ) {
+        return Err(FetchError::InvalidResponse(
+            "forbidden framing field in HTTP trailer".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_chunked_body<R: BufRead>(
+    reader: &mut R,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, FetchError> {
+    const MAX_CHUNK_LINE_BYTES: usize = 8192;
+    let mut body = Vec::new();
+    let mut chunk_count = 0usize;
+    let mut framing_bytes = 0usize;
+    loop {
+        let line = read_bounded_line(reader, MAX_CHUNK_LINE_BYTES)
+            .map_err(FetchError::Http)?
+            .ok_or_else(|| FetchError::InvalidResponse("truncated chunk-size line".into()))?;
+        framing_bytes = framing_bytes.saturating_add(line.len());
+        if framing_bytes > MAX_CHUNK_FRAMING_BYTES {
+            return Err(FetchError::InvalidResponse(
+                "chunk framing exceeds byte limit".into(),
+            ));
+        }
+        let line = line
+            .strip_suffix("\r\n")
+            .ok_or_else(|| FetchError::InvalidResponse("invalid chunk-size terminator".into()))?;
+        if line.bytes().any(|byte| !(0x20..=0x7e).contains(&byte)) {
+            return Err(FetchError::InvalidResponse(
+                "chunk-size line contains a control or non-ASCII byte".into(),
+            ));
+        }
+        let size_text = line.split(';').next().unwrap_or_default();
+        if size_text.is_empty() || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FetchError::InvalidResponse("invalid chunk size".into()));
+        }
+        let chunk_size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| FetchError::InvalidResponse("chunk size overflow".into()))?;
+        if chunk_size == 0 {
+            let mut trailer_bytes = 0usize;
+            let mut trailer_count = 0usize;
+            loop {
+                let trailer = read_bounded_line(reader, MAX_CHUNK_LINE_BYTES)
+                    .map_err(FetchError::Http)?
+                    .ok_or_else(|| FetchError::InvalidResponse("truncated HTTP trailers".into()))?;
+                trailer_bytes = trailer_bytes.saturating_add(trailer.len());
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    return Err(FetchError::InvalidResponse(
+                        "HTTP trailers exceed byte limit".into(),
+                    ));
+                }
+                if trailer == "\r\n" {
+                    return Ok(body);
+                }
+                trailer_count += 1;
+                if trailer_count > 100 {
+                    return Err(FetchError::InvalidResponse("too many HTTP trailers".into()));
+                }
+                validate_trailer_line(&trailer)?;
+            }
+        }
+        chunk_count += 1;
+        if chunk_count > MAX_CHUNK_COUNT {
+            return Err(FetchError::InvalidResponse(
+                "chunk count exceeds configured limit".into(),
+            ));
+        }
+        let new_length = body
+            .len()
+            .checked_add(chunk_size)
+            .ok_or(FetchError::BodyTooLarge {
+                limit: max_body_bytes,
+            })?;
+        if new_length > max_body_bytes {
+            return Err(FetchError::BodyTooLarge {
+                limit: max_body_bytes,
+            });
+        }
+        let start = body.len();
+        body.resize(new_length, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .map_err(FetchError::Http)?;
+        let mut terminator = [0_u8; 2];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(FetchError::Http)?;
+        if terminator != *b"\r\n" {
+            return Err(FetchError::InvalidResponse(
+                "chunk data lacks CRLF terminator".into(),
+            ));
+        }
+    }
+}
+
+fn read_response_body<R: BufRead>(
+    reader: &mut R,
+    status: u16,
+    headers: &[(String, String)],
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, FetchError> {
+    if status == 204 || status == 304 {
+        return Ok(Vec::new());
+    }
+    let content_encoding = single_header_value(headers, "content-encoding")?;
+    if let Some(encoding) = content_encoding
+        && !encoding.eq_ignore_ascii_case("identity")
+    {
+        return Err(FetchError::UnsupportedBodyEncoding(encoding.to_owned()));
+    }
+    let content_length = single_header_value(headers, "content-length")?;
+    let transfer_encoding = single_header_value(headers, "transfer-encoding")?;
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err(FetchError::InvalidResponse(
+            "Content-Length and Transfer-Encoding cannot both frame the response".into(),
+        ));
+    }
+    if let Some(transfer_encoding) = transfer_encoding {
+        if !transfer_encoding.eq_ignore_ascii_case("chunked") {
+            return Err(FetchError::UnsupportedBodyEncoding(format!(
+                "Transfer-Encoding: {transfer_encoding}"
+            )));
+        }
+        return read_chunked_body(reader, max_body_bytes);
+    }
+    if let Some(content_length) = content_length {
+        if content_length.is_empty() || !content_length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(FetchError::InvalidResponse("invalid Content-Length".into()));
+        }
+        let length = content_length
+            .parse::<usize>()
+            .map_err(|_| FetchError::InvalidResponse("Content-Length overflow".into()))?;
+        if length > max_body_bytes {
+            return Err(FetchError::BodyTooLarge {
+                limit: max_body_bytes,
+            });
+        }
+        let mut body = vec![0_u8; length];
+        reader.read_exact(&mut body).map_err(FetchError::Http)?;
+        return Ok(body);
+    }
+
+    // The request explicitly asks the peer to close the connection. Read at
+    // most limit+1 bytes so close-delimited bodies cannot grow without bound.
+    let read_limit = max_body_bytes.saturating_add(1) as u64;
+    let mut body = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut body)
+        .map_err(FetchError::Http)?;
+    if body.len() > max_body_bytes {
+        return Err(FetchError::BodyTooLarge {
+            limit: max_body_bytes,
+        });
+    }
+    Ok(body)
+}
+
 fn redirect_location(headers: &[(String, String)]) -> Result<&str, FetchError> {
     let mut locations = headers
         .iter()
@@ -365,7 +582,11 @@ fn redirect_location(headers: &[(String, String)]) -> Result<&str, FetchError> {
     Ok(location)
 }
 
-fn fetch_once(url: &Url, roots: &RootCertStore) -> Result<FetchHopResult, FetchError> {
+fn fetch_once(
+    url: &Url,
+    roots: &RootCertStore,
+    max_body_bytes: Option<usize>,
+) -> Result<FetchHopResult, FetchError> {
     if url.scheme() != "https" {
         return Err(FetchError::UnsupportedScheme(url.scheme().into()));
     }
@@ -409,26 +630,33 @@ fn fetch_once(url: &Url, roots: &RootCertStore) -> Result<FetchHopResult, FetchE
         target.push('?');
         target.push_str(query);
     }
-    write!(tls, "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: AIBE-Phase0/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n")
+    write!(tls, "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: AIBE-Phase0/0.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n")
         .map_err(FetchError::Http)?;
     tls.flush().map_err(FetchError::Http)?;
 
     let mut reader = BufReader::new(tls);
     let (status, headers) = read_response_headers(&mut reader)?;
+    let body = if is_redirect(status) {
+        Vec::new()
+    } else if let Some(limit) = max_body_bytes {
+        read_response_body(&mut reader, status, &headers, limit)?
+    } else {
+        Vec::new()
+    };
     Ok(FetchHopResult {
         status,
         headers,
         connected_peer,
+        body,
     })
 }
 
-/// Perform a bounded HTTPS GET header probe. Every redirect is resolved and
-/// revalidated independently; non-HTTPS redirects are rejected.
-pub fn fetch_https_headers(
+fn fetch_https_internal(
     initial_url: &str,
     ca_bundle: &Path,
     max_redirects: usize,
-) -> Result<FetchHeadersResult, FetchError> {
+    max_body_bytes: Option<usize>,
+) -> Result<FetchResult, FetchError> {
     let mut current =
         Url::parse(initial_url).map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
     if current.scheme() != "https" {
@@ -438,14 +666,17 @@ pub fn fetch_https_headers(
     let mut redirect_chain = Vec::new();
 
     for hop in 0..=max_redirects.min(MAX_REDIRECTS) {
-        let response = fetch_once(&current, &roots)?;
+        let response = fetch_once(&current, &roots, max_body_bytes)?;
         if !is_redirect(response.status) {
-            return Ok(FetchHeadersResult {
-                final_url: current,
-                status: response.status,
-                headers: response.headers,
-                redirect_chain,
-                connected_peer: response.connected_peer,
+            return Ok(FetchResult {
+                metadata: FetchHeadersResult {
+                    final_url: current,
+                    status: response.status,
+                    headers: response.headers,
+                    redirect_chain,
+                    connected_peer: response.connected_peer,
+                },
+                body: response.body,
             });
         }
 
@@ -465,9 +696,38 @@ pub fn fetch_https_headers(
     Err(FetchError::RedirectLimit)
 }
 
+/// Perform a bounded HTTPS GET header probe. Every redirect is resolved and
+/// revalidated independently; non-HTTPS redirects are rejected.
+pub fn fetch_https_headers(
+    initial_url: &str,
+    ca_bundle: &Path,
+    max_redirects: usize,
+) -> Result<FetchHeadersResult, FetchError> {
+    fetch_https_internal(initial_url, ca_bundle, max_redirects, None).map(|result| result.metadata)
+}
+
+/// Perform a bounded HTTPS GET and return the final response body. The hard
+/// response-body ceiling is 8 MiB; callers may request a lower limit.
+pub fn fetch_https_get(
+    initial_url: &str,
+    ca_bundle: &Path,
+    max_redirects: usize,
+    max_body_bytes: usize,
+) -> Result<FetchResult, FetchError> {
+    if max_body_bytes > MAX_RESPONSE_BODY_BYTES {
+        return Err(FetchError::InvalidResponse(format!(
+            "configured body limit exceeds hard maximum of {MAX_RESPONSE_BODY_BYTES} bytes"
+        )));
+    }
+    fetch_https_internal(initial_url, ca_bundle, max_redirects, Some(max_body_bytes))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_public_ip, is_redirect, read_response_headers, validate_resolution};
+    use super::{
+        is_allowed_public_ip, is_redirect, read_response_body, read_response_headers,
+        validate_resolution,
+    };
     use std::io::Cursor;
     use std::net::IpAddr;
     use url::Url;
@@ -616,11 +876,159 @@ mod tests {
     }
 
     #[test]
+    fn reads_content_length_framed_response_body() {
+        let response = b"hello";
+        let headers = vec![("content-length".into(), "5".into())];
+        assert_eq!(
+            read_response_body(&mut Cursor::new(response), 200, &headers, 16).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn rejects_content_length_body_over_limit_and_truncation() {
+        let too_large = vec![("content-length".into(), "17".into())];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b""), 200, &too_large, 16),
+            Err(super::FetchError::BodyTooLarge { limit: 16 })
+        ));
+        let truncated = vec![("content-length".into(), "5".into())];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b"abc"), 200, &truncated, 16),
+            Err(super::FetchError::Http(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn decodes_chunked_body_and_ignores_valid_trailers() {
+        let response = b"4;ext=yes\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: ok\r\n\r\n";
+        let headers = vec![("transfer-encoding".into(), "chunked".into())];
+        assert_eq!(
+            read_response_body(&mut Cursor::new(response), 200, &headers, 16).unwrap(),
+            b"Wikipedia"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_oversized_chunked_bodies() {
+        let headers = vec![("transfer-encoding".into(), "chunked".into())];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b"4\r\nWikiXX0\r\n\r\n"), 200, &headers, 16),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b"11\r\n"), 200, &headers, 16),
+            Err(super::FetchError::BodyTooLarge { limit: 16 })
+        ));
+        assert!(matches!(
+            read_response_body(
+                &mut Cursor::new(b"4;bad=\x01\r\nWiki\r\n0\r\n\r\n"),
+                200,
+                &headers,
+                16
+            ),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_chunk_count_above_configured_limit() {
+        let mut response = Vec::new();
+        for _ in 0..=super::MAX_CHUNK_COUNT {
+            response.extend_from_slice(b"1\r\nx\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let headers = vec![("transfer-encoding".into(), "chunked".into())];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(response), 200, &headers, 8192),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unsupported_body_framing() {
+        let conflict = vec![
+            ("content-length".into(), "4".into()),
+            ("transfer-encoding".into(), "chunked".into()),
+        ];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b""), 200, &conflict, 16),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+        let unsupported_transfer = vec![("transfer-encoding".into(), "gzip, chunked".into())];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b""), 200, &unsupported_transfer, 16),
+            Err(super::FetchError::UnsupportedBodyEncoding(_))
+        ));
+        let compressed = vec![("content-encoding".into(), "gzip".into())];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b""), 200, &compressed, 16),
+            Err(super::FetchError::UnsupportedBodyEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_content_length_and_forbidden_chunk_trailers() {
+        let duplicate = vec![
+            ("content-length".into(), "4".into()),
+            ("content-length".into(), "4".into()),
+        ];
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b"data"), 200, &duplicate, 16),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+        let chunked = vec![("transfer-encoding".into(), "chunked".into())];
+        assert!(matches!(
+            read_response_body(
+                &mut Cursor::new(b"0\r\nContent-Length: 0\r\n\r\n"),
+                200,
+                &chunked,
+                16
+            ),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn fetch_get_rejects_a_configured_body_limit_above_the_hard_cap() {
+        assert!(matches!(
+            super::fetch_https_get(
+                "not-even-a-url",
+                std::path::Path::new("/does/not/need/to/exist"),
+                0,
+                super::MAX_RESPONSE_BODY_BYTES + 1
+            ),
+            Err(super::FetchError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn reads_close_delimited_body_with_a_hard_limit() {
+        assert_eq!(
+            read_response_body(&mut Cursor::new(b"body"), 200, &[], 4).unwrap(),
+            b"body"
+        );
+        assert!(matches!(
+            read_response_body(&mut Cursor::new(b"body!"), 200, &[], 4),
+            Err(super::FetchError::BodyTooLarge { limit: 4 })
+        ));
+    }
+
+    #[test]
+    fn bodyless_status_ignores_unframed_body_bytes() {
+        assert!(
+            read_response_body(&mut Cursor::new(b"ignored"), 204, &[], 16)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn rejects_private_ip_before_attempting_tls_connection() {
         let url = Url::parse("https://127.0.0.1/").expect("URL parses");
         let roots = rustls::RootCertStore::empty();
         assert!(matches!(
-            super::fetch_once(&url, &roots),
+            super::fetch_once(&url, &roots, None),
             Err(super::FetchError::AddressDenied(IpAddr::V4(address))) if address.is_loopback()
         ));
     }

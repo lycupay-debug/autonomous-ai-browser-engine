@@ -467,3 +467,30 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Updated `README.md` and `dependency-audit.md` to correct stale SBOM/workspace counts. Current Cargo metadata: 211 total packages, eight workspace crates, 203 third-party packages; all 203 third-party packages have license metadata. The tracked `sbom/` directory still contains five historical files; CI regenerates and validates the complete eight-file set as artifacts.
 - GitHub Actions Run `41288165444` for commit `e4421a17cbf4afd9c40cc3287961ff5c9be14335` completed successfully: Rust format/test/Clippy job passed; `cargo-audit` 0.22.2 passed; eight CycloneDX 1.5 SBOMs generated, validated and uploaded.
 - Project license remains undecided. Cargo metadata and SBOM coverage do not constitute a legal audit and do not cover native FreeBSD packages or extracted runtime assets.
+
+## Incremental R&D record｜2026-11-01（Bounded HTTPS response-body loading PoC）
+
+### Implementation
+
+- Extended the Network Policy PoC with `fetch_https_get()` and `FetchResult`; the existing header-only API remains available.
+- Added bounded HTTP/1.1 response-body framing for `Content-Length`, `Transfer-Encoding: chunked`, and connection-close-delimited bodies.
+- Hard response body cap: 8 MiB. Chunked responses additionally cap chunk count at 4,096, chunk-framing bytes at 1 MiB, trailer bytes at 64 KiB, trailer count at 100, and each line at 8 KiB.
+- Rejects duplicate framing headers, simultaneous Content-Length and Transfer-Encoding, unsupported transfer/content encodings, truncated Content-Length bodies, malformed chunk terminators, invalid chunk-size bytes, forbidden framing fields in trailers, excessive body/chunk/framing/trailer sizes, and oversized caller limits.
+- Sends `Accept-Encoding: identity`; compressed response decoding is deliberately not implemented. Redirect response bodies are discarded; every redirect still resolves, validates HTTPS, re-resolves DNS, revalidates the complete IP answer set, and connects to a pinned validated address.
+- Added CLI `--body` mode that reports body length and a bounded hex prefix. Updated the opt-in live integration script to exercise body reads for a direct request and a redirected request.
+
+### Verification
+
+- Network Policy: 27/27 tests passed, including Content-Length, chunked, close-delimited, size limits, malformed framing, duplicate headers, trailer validation, chunk-count bounds, and unsupported encoding rejection.
+- Full FreeBSD workspace: 133/133 tests passed.
+- Workspace Clippy `-D warnings`, Rustfmt, `git diff --check`, full security PoC suite, shell/Python syntax checks, and all eight synthetic SBOM fixtures passed.
+- Live opt-in integration `AIBE_RUN_NETWORK_INTEGRATION=1 ./scripts/run-network-poc.sh` passed:
+  - `https://example.com/`: HTTP 200, chunked body decoded, 577 bytes.
+  - `https://httpbin.org/redirect/1`: 302 redirect to `/get`, final HTTP 200, Content-Length body decoded, 240 bytes.
+- These are live point-in-time endpoint checks, not a reproducible general Internet compatibility test.
+
+### Limits
+
+- HTTP/1.1 GET only. No HTTP/2/3, compression, cookies, cache, CORS/Fetch semantics, request methods/bodies, streaming API, cancellation propagation, download broker, or persistent connection pool.
+- The Network Policy PoC is not connected to NavigationController, HTML Parser, Worker script execution, or a production Network Service. No browser document was parsed from the retrieved body.
+- The 8 MiB body limit and chunk limits are Phase 0 safety bounds, not final product resource budgets.
