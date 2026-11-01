@@ -55,3 +55,20 @@ The initial Jail boundary must:
 - Host process plus Capsicum only: retained as a defense-in-depth layer, but not selected as the sole isolation boundary.
 - One VM per Renderer: stronger kernel boundary but disproportionate startup/resource cost for the current Phase 0 target.
 - `path=/` Jail: rejected for production because it does not provide a dedicated filesystem root.
+
+
+## Implementation update｜2026-11-02
+
+- The Rust `RendererSupervisor::spawn_in_jail()` adapter now creates a persistent Jail, mounts a dedicated minimal devfs ruleset, applies optional Jail-scoped RCTL deny limits **before** starting the Renderer with `jexec`, and authenticates the UDS peer against kernel PID/UID/GID/JID/PPID and process start time.
+- The Supervisor owns Jail termination, RCTL rule removal, devfs unmount/ruleset deletion, grant cleanup and optional per-instance rootfs deletion. The unisolated host launcher has been renamed `spawn_unisolated_for_test` and is not the production launch path.
+- `scripts/build-renderer-rootfs.sh` assembles a root-owned rootfs with the Renderer binary, resolved system/V8 shared libraries, private `/run`, per-instance sticky `/tmp`, and a minimal `/dev` mount supplied by the Supervisor. Runtime library files are shared only as read-only hardlinks where safe; immutable base-system files are copied with flags cleared on the copies, never on host source files.
+- `snapshot-bridge-renderer` initializes V8 before entering Capsicum, then parses the Snapshot frame and evaluates the page-controlled tree only after `cap_enter()` has succeeded.
+- FreeBSD 15.1-RELEASE-p6 integration tests launched two real V8 Renderers concurrently in two distinct Jails; both processed a DOM Snapshot under Capsicum and exited through Supervisor cleanup. Jail IPv4/IPv6 disablement, restricted devfs, descriptor inheritance, Jail-scoped `maxproc`, rootfs validation, process-tree termination and grant cleanup were also verified.
+- No production RCTL memory/swap budget is set. A short two-Renderer sample showed approximately `memoryuse=35M`, `RSS=35,740 KB`, `vmemoryuse=1444G`, `swapuse≈1483–1500G`, `openfiles=40`, `maxproc=1`, `nthr=2`. This is a short sample, not a peak. V8's very large virtual address reservation makes `vmemoryuse`/`swapuse` unsuitable as direct physical-memory budgets; representative stress measurements are still required.
+
+## Remaining work
+
+- Complete the Renderer FD rights allowlist and SCM_RIGHTS capability authorization; the current Capsicum integration enters capability mode but does not yet define the final per-descriptor rights policy.
+- Integrate the production Broker request protocol and mediated network service with the jailed Renderer.
+- Measure 10/50/100 concurrent V8 Renderers, startup/teardown latency, failure recovery, physical memory peaks and virtual-address accounting before setting production RCTL limits.
+- The current V8 Renderer remains a Snapshot bridge PoC, not the complete browser Renderer implementation. No production deployment or persistent host resource rules have been made.

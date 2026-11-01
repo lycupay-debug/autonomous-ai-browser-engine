@@ -6,8 +6,11 @@ use std::time::Duration;
 use aibe_control_protocol_uds_poc::snapshot_frame::read_dom_snapshot_frame;
 
 #[cfg(target_os = "freebsd")]
-fn ingest_snapshot_into_v8(envelope: &serde_json::Value) -> io::Result<()> {
-    use aibe_js_runtime_ffi_poc::V8Runtime;
+fn ingest_snapshot_into_v8(
+    runtime: &mut aibe_js_runtime_ffi_poc::V8Runtime,
+    realm: aibe_js_runtime_ffi_poc::JsRealmId,
+    envelope: &serde_json::Value,
+) -> io::Result<()> {
     use aibe_js_runtime_ffi_poc::{JsRuntime, JsValue};
 
     let tree_json = serde_json::to_string(&envelope["tree"]).map_err(io::Error::other)?;
@@ -66,14 +69,6 @@ fn ingest_snapshot_into_v8(envelope: &serde_json::Value) -> io::Result<()> {
         }})()"#
     );
 
-    let mut runtime = V8Runtime::new().map_err(io::Error::other)?;
-    let origin = runtime.create_origin().map_err(io::Error::other)?;
-    let realm = runtime
-        .create_realm_for_origin(origin)
-        .map_err(io::Error::other)?;
-    runtime
-        .initialize_document(realm)
-        .map_err(io::Error::other)?;
     let result = runtime
         .evaluate_value_in_realm(realm, &script)
         .map_err(io::Error::other)?;
@@ -118,6 +113,27 @@ fn main() -> io::Result<()> {
         .ok_or_else(|| io::Error::other("usage: snapshot-bridge-renderer <socket-path>"))?;
     let mut stream = UnixStream::connect(socket_path)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    #[cfg(target_os = "freebsd")]
+    let mut runtime = {
+        use aibe_js_runtime_ffi_poc::{JsRuntime, V8Runtime};
+        let mut runtime = V8Runtime::new().map_err(io::Error::other)?;
+        let origin = runtime.create_origin().map_err(io::Error::other)?;
+        let realm = runtime
+            .create_realm_for_origin(origin)
+            .map_err(io::Error::other)?;
+        runtime
+            .initialize_document(realm)
+            .map_err(io::Error::other)?;
+        (runtime, realm)
+    };
+
+    // Load V8, create the Realm and initialize trusted host objects before
+    // capability mode. Untrusted Snapshot parsing and JS evaluation happen
+    // only after the Renderer has entered Capsicum.
+    #[cfg(target_os = "freebsd")]
+    aibe_renderer_supervisor_poc::enter_renderer_capability_mode()?;
+
     let frame = read_dom_snapshot_frame(&mut stream)?;
     if frame.request_id != 71 || frame.document_id != 1 || frame.revision != 1 {
         return Err(io::Error::other(
@@ -144,6 +160,9 @@ fn main() -> io::Result<()> {
         return Err(io::Error::other("Renderer received an empty DOM tree"));
     }
 
+    #[cfg(target_os = "freebsd")]
+    ingest_snapshot_into_v8(&mut runtime.0, runtime.1, &envelope)?;
+    #[cfg(not(target_os = "freebsd"))]
     ingest_snapshot_into_v8(&envelope)?;
 
     // Keep the Renderer alive until Broker explicitly closes the channel.

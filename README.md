@@ -16,7 +16,7 @@ The current V8 FFI PoC models host-issued origin groups separately from JavaScri
 - No Playwright runtime, Chromium, or Servo as the final execution core.
 - Headless-first; headed mode is retained as a later backend.
 - AI has broad browser-level control, while host access and dangerous operations remain policy-gated.
-- Security threat modeling and negative tests start in Phase 0 and continue throughout development. The accepted Renderer isolation direction is one dedicated FreeBSD Jail per Renderer; see `docs/adr/0002-renderer-isolation-one-jail-per-renderer.md`.
+- Security threat modeling and negative tests start in Phase 0 and continue throughout development. The accepted Renderer isolation direction is one dedicated FreeBSD Jail per Renderer; the Supervisor-to-Jail lifecycle and V8+Capsicum integration now have FreeBSD 15.1 integration-test evidence. See `docs/adr/0002-renderer-isolation-one-jail-per-renderer.md` and `docs/phase-0/README.md`.
 - No compatibility claims without pinned WPT/Test262 versions and published results.
 
 ## Repository layout
@@ -29,6 +29,8 @@ The current V8 FFI PoC models host-issued origin groups separately from JavaScri
 - `experiments/html-parser/`: html5ever-backed HTML5 parsing PoC with a project-owned bounded DOM node arena.
 - `experiments/js-runtime/benchmarks/`: common cross-runtime JavaScript microbenchmark.
 - `experiments/security/`: FreeBSD Capsicum, per-origin storage descriptor, crash-recovery, peer-credential, Jail network-isolation and one-Renderer/one-Jail lifecycle PoCs.
+- `experiments/renderer-supervisor/`: host-side Renderer lifecycle Supervisor with a FreeBSD Jail adapter, kernel PID/JID binding, per-Jail RCTL and rootfs/devfs cleanup.
+- `scripts/build-renderer-rootfs.sh`: assemble a root-owned per-Renderer rootfs from the built Renderer and its resolved FreeBSD shared-library dependencies.
 - `experiments/headless/raster-poc/`: OpenType shaping, CPU glyph rasterization and PNG/JPEG/GIF/WebP decode PoC.
 - `experiments/network-policy/`: outbound IP policy, pinned TCP/TLS, SNI/certificate verification and per-redirect revalidation PoC.
 - `docs/adr/`: accepted architecture decision records.

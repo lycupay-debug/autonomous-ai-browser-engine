@@ -18,6 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aibe_broker_policy_poc::{GrantRegistry, RendererId, RendererPrincipal, SnapshotGrantRegistry};
 use aibe_control_protocol_uds_poc::{bind_private_socket, peer_process_credentials};
 
+#[cfg(target_os = "freebsd")]
+mod freebsd_jail;
+#[cfg(target_os = "freebsd")]
+pub use freebsd_jail::{FreeBsdJailConfig, RendererRctlLimits};
+
 static NEXT_RENDERER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_SOCKET_NONCE: AtomicU64 = AtomicU64::new(1);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -25,9 +30,108 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ManagedRenderer {
     principal: RendererPrincipal,
-    child: Child,
+    process: ManagedProcess,
     stream: UnixStream,
     socket_path: PathBuf,
+}
+
+enum ManagedProcess {
+    Host(Child),
+    #[cfg(target_os = "freebsd")]
+    Jail {
+        launcher: Child,
+        name: String,
+        jid: i32,
+        renderer_pid: u32,
+        process_start: (i64, i64),
+        renderer_uid: u32,
+        rootfs: PathBuf,
+        devfs: freebsd_jail::DevfsMount,
+        rctl_rules_applied: bool,
+        cleanup_rootfs_on_exit: bool,
+    },
+}
+
+impl ManagedProcess {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Host(child) => child.try_wait(),
+            #[cfg(target_os = "freebsd")]
+            Self::Jail {
+                launcher,
+                name,
+                jid,
+                renderer_pid,
+                process_start,
+                renderer_uid,
+                devfs,
+                rctl_rules_applied,
+                cleanup_rootfs_on_exit,
+                rootfs,
+                ..
+            } => {
+                if let Some(status) = launcher.try_wait()? {
+                    freebsd_jail::remove_jail_if_present(name, *rctl_rules_applied)?;
+                    devfs.unmount()?;
+                    if *cleanup_rootfs_on_exit {
+                        std::fs::remove_dir_all(rootfs)?;
+                    }
+                    return Ok(Some(status));
+                }
+                match freebsd_jail::process_jail_identity(*renderer_pid)? {
+                    Some(identity)
+                        if identity.jid == *jid
+                            && identity.uid == *renderer_uid
+                            && identity.start == *process_start =>
+                    {
+                        Ok(None)
+                    }
+                    _ => {
+                        freebsd_jail::remove_jail_if_present(name, *rctl_rules_applied)?;
+                        devfs.unmount()?;
+                        let status = launcher.wait()?;
+                        if *cleanup_rootfs_on_exit {
+                            std::fs::remove_dir_all(rootfs)?;
+                        }
+                        Ok(Some(status))
+                    }
+                }
+            }
+        }
+    }
+
+    fn terminate(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Host(child) => match child.try_wait()? {
+                Some(status) => Ok(status),
+                None => {
+                    child.kill()?;
+                    child.wait()
+                }
+            },
+            #[cfg(target_os = "freebsd")]
+            Self::Jail {
+                launcher,
+                name,
+                devfs,
+                rctl_rules_applied,
+                cleanup_rootfs_on_exit,
+                rootfs,
+                ..
+            } => {
+                freebsd_jail::remove_jail_if_present(name, *rctl_rules_applied)?;
+                devfs.unmount()?;
+                let status = match launcher.try_wait()? {
+                    Some(status) => status,
+                    None => launcher.wait()?,
+                };
+                if *cleanup_rootfs_on_exit {
+                    std::fs::remove_dir_all(rootfs)?;
+                }
+                Ok(status)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -79,7 +183,9 @@ impl RendererSupervisor {
     /// Spawn a Renderer command and accept its private UDS connection.
     /// The socket path is appended as the final command-line argument.
     /// No RendererPrincipal is accepted from the caller.
-    pub fn spawn(
+    /// Unisolated host-process launch retained only for Phase 0 lifecycle tests.
+    /// Never use this for page-controlled production content; use `spawn_in_jail`.
+    pub fn spawn_unisolated_for_test(
         &mut self,
         mut command: Command,
         connect_timeout: Duration,
@@ -126,7 +232,7 @@ impl RendererSupervisor {
             principal.id(),
             ManagedRenderer {
                 principal,
-                child,
+                process: ManagedProcess::Host(child),
                 stream,
                 socket_path,
             },
@@ -309,7 +415,7 @@ impl RendererSupervisor {
     ) -> io::Result<Vec<RendererExit>> {
         let mut exited = Vec::new();
         for (id, renderer) in &mut self.renderers {
-            if let Some(status) = renderer.child.try_wait()? {
+            if let Some(status) = renderer.process.try_wait()? {
                 exited.push((*id, renderer.principal, status));
             }
         }
@@ -344,16 +450,7 @@ impl RendererSupervisor {
             let renderer = self.renderers.get_mut(&id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "Renderer instance is not managed")
             })?;
-            match renderer.child.try_wait()? {
-                Some(status) => status,
-                None => match renderer.child.kill() {
-                    Ok(()) => renderer.child.wait()?,
-                    Err(kill_error) => match renderer.child.try_wait()? {
-                        Some(status) => status,
-                        None => return Err(kill_error),
-                    },
-                },
-            }
+            renderer.process.terminate()?
         };
         let renderer = self
             .renderers
@@ -396,15 +493,40 @@ impl RendererSupervisor {
     }
 }
 
+/// Enter FreeBSD Capsicum capability mode in the calling Renderer process.
+/// All required runtime libraries and filesystem resources must be opened first.
+#[cfg(target_os = "freebsd")]
+pub fn enter_renderer_capability_mode() -> io::Result<()> {
+    if unsafe { libc::cap_enter() } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut mode: libc::c_uint = 0;
+    if unsafe { libc::cap_getmode(&mut mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if mode != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Capsicum capability mode was not enabled",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn enter_renderer_capability_mode() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Capsicum capability mode requires FreeBSD",
+    ))
+}
+
 impl Drop for RendererSupervisor {
     // Emergency process cleanup only. Call shutdown() when grant registries
     // are available so their per-Renderer records are also released.
     fn drop(&mut self) {
         for (_, mut renderer) in self.renderers.drain() {
-            if renderer.child.try_wait().ok().flatten().is_none() {
-                let _ = renderer.child.kill();
-                let _ = renderer.child.wait();
-            }
+            let _ = renderer.process.terminate();
             drop(renderer.stream);
             let _ = std::fs::remove_file(renderer.socket_path);
         }
