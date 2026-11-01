@@ -116,8 +116,19 @@ fn main() -> io::Result<()> {
     let socket_path = env::args_os()
         .nth(1)
         .ok_or_else(|| io::Error::other("usage: snapshot-bridge-renderer <socket-path>"))?;
+    let idle_timeout_ms = env::var("AIBE_RENDERER_IDLE_TIMEOUT_MS")
+        .ok()
+        .map(|value| value.parse::<u64>().map_err(io::Error::other))
+        .transpose()?
+        .unwrap_or(5_000);
+    if !(1_000..=300_000).contains(&idle_timeout_ms) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Renderer idle timeout must be between 1000 and 300000 ms",
+        ));
+    }
     let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(idle_timeout_ms)))?;
 
     #[cfg(target_os = "freebsd")]
     let mut runtime = {
