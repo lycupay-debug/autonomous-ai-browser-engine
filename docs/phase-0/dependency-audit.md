@@ -75,3 +75,9 @@ Do not choose or publish a project license until the owner explicitly approves i
 - The checked-in `sbom/` directory currently contains five historical files from an earlier dependency graph. CI regenerates the complete nine-file set and uploads it as a workflow artifact; the five tracked files are not a current complete SBOM set.
 - Cargo SBOM coverage excludes native FreeBSD packages (V8, SpiderMonkey), base-system libraries, extracted SDK assets, fonts, and the complete host package closure. Those require a separate host/runtime bill of materials.
 - No project-wide license has been selected. License metadata completeness is not permission to redistribute the repository or its assets.
+
+## 2026-11-01 HTML snapshot serialization dependency update
+
+- `aibe-html-parser-poc` now directly pins `serde_json` 1.0.154 to encode its versioned flat DOM snapshot. This package was already present in the workspace lockfile through existing dependencies; the direct declaration does not add a new resolved package version.
+- The workspace SBOM generator already enumerates all nine workspace crates, including the HTML Parser. The tracked five-file SBOM directory remains historical/incomplete until the supply-chain CI regenerates and validates all nine documents for the current commit.
+- The current change must pass the workflow's `cargo-audit` 0.22.2 scan and nine-crate CycloneDX 1.5 generation/validation before the updated dependency graph is called clean/current.

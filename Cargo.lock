@@ -50,6 +50,7 @@ name = "aibe-html-parser-poc"
 version = "0.1.0"
 dependencies = [
  "html5ever",
+ "serde_json",
 ]
 
 [[package]]

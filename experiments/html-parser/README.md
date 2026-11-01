@@ -22,3 +22,9 @@ This crate uses `html5ever` 0.40.1 for HTML tokenization and WHATWG-style tree c
 - DOM mutation APIs, events, Web IDL bindings, JavaScript wrapper identity, layout, CSS, forms, focus or accessibility.
 - Network Service IPC or automatic Navigation integration. `NavigationController` can attach a parsed tree to a live Document via `parse_document_html()` or atomically parse-before-commit via `commit_navigation_with_html()`, but the live network CLI handoff is currently a separate process/temporary-file experiment.
 - The parser dependency is not a claim of full WHATWG HTML conformance. WPT/html5lib test suites and fuzzing remain required before untrusted public HTML can be treated as production-safe.
+
+## Versioned DOM snapshot export
+
+`HtmlDocument::to_snapshot_json()` exports a bounded, versioned flat snapshot (`schemaVersion: 1`) containing document-local node IDs, parent/child edges, node types, element namespaces, attributes, template-content references, parse diagnostics and quirks mode. The JSON payload is capped at 8 MiB. The flat representation avoids recursive serialization of adversarially deep trees and is suitable for a future authenticated IPC handoff.
+
+Node IDs are valid only within the parsed Document generation. A caller must pair them with its own Document ID/revision and invalidate them when the tree is replaced. This is an immutable snapshot, not a live DOM, not a Web IDL binding, and not a cross-process authorization token. The serializer does not execute page scripts or create V8 wrappers.
