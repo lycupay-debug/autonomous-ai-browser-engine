@@ -457,3 +457,13 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Frame/Document/Worker ownership is still a deterministic host-side model. There is no actual iframe DOM integration, parser-driven browsing-context creation, page lifecycle event dispatch, real Network Loader, or browser task/event loop.
 - Failure recovery is tested with an injected Runtime teardown error; this does not prove recovery from arbitrary native V8 process crashes.
 - No production service, persistent FreeBSD configuration, sysctl, or host service state was changed.
+
+
+## Incremental R&D record｜2026-11-01（Web Capability Matrix evidence reconciliation）
+
+- Updated `docs/phase-0/web-capability-matrix.md` to show current Phase 0 evidence and implementation status beside each target user task. It explicitly distinguishes absent capabilities from isolated PoCs and end-to-end implementation.
+- Current P0 blockers are visible: no HTML parser/response-body loader, no parser-backed DOM or stable AI node query/evidence API, no forms/input model, and no HTML Event Loop/SPA integration. Navigation/redirect, V8 DOM host objects, Origin isolation, and microtask scheduling remain separate PoCs until connected.
+- Worker evidence is recorded as ownership/Realm lifecycle plus a caller-fed redirect-chain Origin validation contract; no Worker script fetch/execution or WorkerGlobalScope is claimed.
+- Updated `README.md` and `dependency-audit.md` to correct stale SBOM/workspace counts. Current Cargo metadata: 211 total packages, eight workspace crates, 203 third-party packages; all 203 third-party packages have license metadata. The tracked `sbom/` directory still contains five historical files; CI regenerates and validates the complete eight-file set as artifacts.
+- GitHub Actions Run `41288165444` for commit `e4421a17cbf4afd9c40cc3287961ff5c9be14335` completed successfully: Rust format/test/Clippy job passed; `cargo-audit` 0.22.2 passed; eight CycloneDX 1.5 SBOMs generated, validated and uploaded.
+- Project license remains undecided. Cargo metadata and SBOM coverage do not constitute a legal audit and do not cover native FreeBSD packages or extracted runtime assets.

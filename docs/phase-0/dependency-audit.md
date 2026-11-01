@@ -62,3 +62,14 @@ Do not choose or publish a project license until the owner explicitly approves i
 - The unmaintained font-stack warnings have been addressed by dependency replacement. The upgraded Rustls advisories are pending a new GitHub Actions cargo-audit run; do not mark the dependency scan clean until that run completes.
 - Post-remediation Cargo metadata scan: 208 total packages, 203 third-party packages, all 203 third-party packages declare license metadata, and five project-owned crates remain without a selected project license.
 - The five committed SBOM files still describe the previous dependency graph; regenerate and validate them from this lockfile before treating repository SBOMs as current.
+
+
+## Current Cargo and supply-chain status — 2026-11-01
+
+- Current locked workspace metadata: 211 packages total, comprising eight project-owned workspace crates and 203 third-party packages.
+- All 203 third-party packages declare license metadata in Cargo metadata. This does not constitute legal approval. The eight project-owned PoC crates intentionally have no selected project license; `docs/phase-0/LICENSING_DECISION.md` remains pending.
+- The SBOM generator and validator now expect eight CycloneDX 1.5 documents: Boa host, Broker policy, Browser Runtime, UDS control protocol, Headless raster, JS Runtime FFI, Network policy, and Origin policy.
+- GitHub Actions Run `41288165444` completed successfully for commit `e4421a17cbf4afd9c40cc3287961ff5c9be14335`: Rust formatting, workspace tests and Clippy passed; `cargo-audit` 0.22.2 passed; `cargo-cyclonedx` 0.5.9 generated all eight per-crate SBOMs and the validator passed. Both workflow jobs completed successfully for this commit.
+- The checked-in `sbom/` directory currently contains five historical files from an earlier dependency graph. CI regenerates all eight files and uploads them as a workflow artifact; the five tracked files are not a current complete SBOM set.
+- Cargo SBOM coverage excludes native FreeBSD packages (V8, SpiderMonkey), base-system libraries, extracted SDK assets, fonts, and the complete host package closure. Those require a separate host/runtime bill of materials.
+- No project-wide license has been selected. License metadata completeness is not permission to redistribute the repository or its assets.
