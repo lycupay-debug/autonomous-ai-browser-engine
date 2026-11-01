@@ -25,6 +25,9 @@ pub trait OriginRealmRuntime {
     fn create_origin(&mut self) -> Result<Self::Origin, Self::Error>;
     fn create_realm_for_origin(&mut self, origin: Self::Origin)
     -> Result<Self::Realm, Self::Error>;
+    fn initialize_document(&mut self, _realm: Self::Realm) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn destroy_realm(&mut self, realm: Self::Realm) -> Result<(), Self::Error>;
 }
 
@@ -42,6 +45,10 @@ impl<T: JsRuntime> OriginRealmRuntime for T {
         origin: Self::Origin,
     ) -> Result<Self::Realm, Self::Error> {
         JsRuntime::create_realm_for_origin(self, origin)
+    }
+
+    fn initialize_document(&mut self, realm: Self::Realm) -> Result<(), Self::Error> {
+        JsRuntime::initialize_document(self, realm)
     }
 
     fn destroy_realm(&mut self, realm: Self::Realm) -> Result<(), Self::Error> {
@@ -179,6 +186,19 @@ impl<R: OriginRealmRuntime> OriginRealmCoordinator<R> {
         self.realm_origins.get(&realm).copied()
     }
 
+    /// Installs the minimal host Document object only in a tracked Document Realm.
+    pub fn initialize_document(
+        &mut self,
+        realm: R::Realm,
+    ) -> Result<(), BrowserRuntimeOriginError<R::Error>> {
+        if !self.realm_origins.contains_key(&realm) {
+            return Err(BrowserRuntimeOriginError::UnknownRealm);
+        }
+        self.runtime
+            .initialize_document(realm)
+            .map_err(BrowserRuntimeOriginError::Runtime)
+    }
+
     /// Checks a URL against a live host-issued Origin Group without creating
     /// a temporary JS Realm or extending that group's lifetime.
     pub fn url_matches_origin_group(
@@ -253,7 +273,7 @@ impl<R: OriginRealmRuntime> OriginRealmCoordinator<R> {
 #[cfg(test)]
 mod tests {
     use super::{BrowserRuntimeOriginError, OriginRealmCoordinator, OriginRealmRuntime};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fmt;
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -281,6 +301,8 @@ mod tests {
         fail_next_realm: bool,
         fail_on_realm: Option<u64>,
         fail_destroy_realm_once: Option<u64>,
+        fail_initialize_document_once: Option<u64>,
+        initialized_documents: HashSet<MockRealm>,
     }
 
     impl OriginRealmRuntime for MockRuntime {
@@ -308,12 +330,25 @@ mod tests {
             Ok(realm)
         }
 
+        fn initialize_document(&mut self, realm: Self::Realm) -> Result<(), Self::Error> {
+            if self.fail_initialize_document_once == Some(realm.0) {
+                self.fail_initialize_document_once = None;
+                return Err(MockError);
+            }
+            if !self.realms.contains_key(&realm) {
+                return Err(MockError);
+            }
+            self.initialized_documents.insert(realm);
+            Ok(())
+        }
+
         fn destroy_realm(&mut self, realm: Self::Realm) -> Result<(), Self::Error> {
             if self.fail_destroy_realm_once == Some(realm.0) {
                 self.fail_destroy_realm_once = None;
                 return Err(MockError);
             }
             self.realms.remove(&realm).ok_or(MockError)?;
+            self.initialized_documents.remove(&realm);
             Ok(())
         }
     }
@@ -425,6 +460,219 @@ mod tests {
             .unwrap();
         assert_eq!(coordinator.active_origin_group_count(), 1);
         assert!(coordinator.origin_group_for_realm(retry).is_some());
+    }
+
+    #[test]
+    fn document_realms_are_initialized_but_worker_realms_are_not() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let document = controller.current_document_id(frame).unwrap();
+        let document_realm = controller.document(document).unwrap().realm();
+        assert!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .contains(&document_realm)
+        );
+
+        let worker = controller
+            .create_dedicated_worker(document, "https://a.example/worker.js")
+            .unwrap();
+        let worker_realm = controller.worker(worker).unwrap().realm();
+        assert!(
+            !controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .contains(&worker_realm)
+        );
+
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/next", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .len(),
+            2,
+            "the candidate Document is initialized before commit while the old Document remains live"
+        );
+        let committed = controller.commit_navigation(navigation).unwrap();
+        let committed_realm = controller.document(committed).unwrap().realm();
+        assert!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .contains(&committed_realm)
+        );
+        assert!(
+            !controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .contains(&document_realm)
+        );
+        assert!(
+            !controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .contains(&worker_realm)
+        );
+    }
+
+    #[test]
+    fn child_document_realms_initialize_for_inherited_and_sandboxed_frames() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let inherited = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Inherited)
+            .unwrap();
+        let sandboxed = controller
+            .create_child_frame(root, "about:blank", NavigationMode::Sandboxed)
+            .unwrap();
+
+        for frame in [root, inherited, sandboxed] {
+            let document = controller.current_document_id(frame).unwrap();
+            let realm = controller.document(document).unwrap().realm();
+            assert!(
+                controller
+                    .coordinator()
+                    .runtime()
+                    .initialized_documents
+                    .contains(&realm)
+            );
+        }
+        assert_eq!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn redirect_reinitializes_document_surface_for_the_final_candidate_realm() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let mut controller = NavigationController::new(MockRuntime::default()).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let navigation = controller
+            .begin_navigation(frame, "https://b.example/first", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .len(),
+            2
+        );
+        controller
+            .redirect(navigation, "https://c.example/final")
+            .unwrap();
+        assert_eq!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .len(),
+            2
+        );
+        let committed = controller.commit_navigation(navigation).unwrap();
+        let realm = controller.document(committed).unwrap().realm();
+        assert!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .contains(&realm)
+        );
+        assert_eq!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn root_document_initialization_failure_releases_the_new_realm_and_origin() {
+        let runtime = MockRuntime {
+            fail_initialize_document_once: Some(1),
+            ..MockRuntime::default()
+        };
+        let mut controller = super::navigation::NavigationController::new(runtime).unwrap();
+        assert!(controller.create_root_frame("https://a.example/").is_err());
+        assert_eq!(controller.coordinator().active_origin_group_count(), 0);
+        assert!(controller.coordinator().runtime().realms.is_empty());
+        assert!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_document_initialization_cleanup_is_retained_and_retryable() {
+        let runtime = MockRuntime {
+            fail_initialize_document_once: Some(1),
+            fail_destroy_realm_once: Some(1),
+            ..MockRuntime::default()
+        };
+        let mut controller = super::navigation::NavigationController::new(runtime).unwrap();
+        assert!(matches!(
+            controller.create_root_frame("https://a.example/"),
+            Err(super::navigation::NavigationError::DocumentInitializationCleanupFailed { .. })
+        ));
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+        assert_eq!(controller.coordinator().runtime().realms.len(), 1);
+        assert_eq!(
+            controller.retry_document_initialization_cleanup().unwrap(),
+            1
+        );
+        assert_eq!(controller.coordinator().active_origin_group_count(), 0);
+        assert!(controller.coordinator().runtime().realms.is_empty());
+    }
+
+    #[test]
+    fn document_initialization_failure_cleans_candidate_and_preserves_current_document() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let runtime = MockRuntime {
+            fail_initialize_document_once: Some(2),
+            ..MockRuntime::default()
+        };
+        let mut controller = NavigationController::new(runtime).unwrap();
+        let frame = controller.create_root_frame("https://a.example/").unwrap();
+        let original = controller.current_document_id(frame).unwrap();
+        assert!(
+            controller
+                .begin_navigation(frame, "https://b.example/next", NavigationMode::Url)
+                .is_err()
+        );
+        assert_eq!(controller.current_document_id(frame), Some(original));
+        assert_eq!(controller.pending_navigation_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 1);
+        assert_eq!(controller.coordinator().runtime().realms.len(), 1);
+        assert_eq!(
+            controller
+                .coordinator()
+                .runtime()
+                .initialized_documents
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -939,6 +1187,67 @@ mod tests {
 mod v8_integration_tests {
     use super::OriginRealmCoordinator;
     use aibe_js_runtime_ffi_poc::{JsValue, V8Runtime};
+
+    #[test]
+    fn navigation_controller_installs_and_evaluates_document_surface_in_v8() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let mut controller = NavigationController::new(runtime).expect("controller initializes");
+        let frame = controller
+            .create_root_frame("https://example.com/")
+            .expect("root Frame creates a Document");
+        let original = controller.current_document_id(frame).unwrap();
+        assert_eq!(
+            controller
+                .evaluate_document_value(original, "document.nodeType")
+                .unwrap(),
+            JsValue::Number(9.0)
+        );
+        assert_eq!(
+            controller
+                .evaluate_document_value(
+                    original,
+                    "document.documentElement.appendChild(new Node()); document.documentElement.childCount()",
+                )
+                .unwrap(),
+            JsValue::Number(1.0)
+        );
+
+        let child = controller
+            .create_child_frame(frame, "about:blank", NavigationMode::Inherited)
+            .expect("inherited child Frame creates a Document");
+        let child_document = controller.current_document_id(child).unwrap();
+        assert_eq!(
+            controller
+                .evaluate_document_value(child_document, "document.nodeType")
+                .unwrap(),
+            JsValue::Number(9.0)
+        );
+
+        let navigation = controller
+            .begin_navigation(frame, "https://other.example/", NavigationMode::Url)
+            .unwrap();
+        assert_eq!(
+            controller.current_document_id(frame),
+            Some(original),
+            "the old Document remains current until navigation commit"
+        );
+        let replacement = controller.commit_navigation(navigation).unwrap();
+        assert_eq!(
+            controller
+                .evaluate_document_value(replacement, "document.nodeType")
+                .unwrap(),
+            JsValue::Number(9.0)
+        );
+        assert!(matches!(
+            controller.evaluate_document_value(original, "document.nodeType"),
+            Err(super::navigation::NavigationError::UnknownDocument)
+        ));
+        assert!(matches!(
+            controller.evaluate_document_value(child_document, "document.nodeType"),
+            Err(super::navigation::NavigationError::UnknownDocument)
+        ));
+    }
 
     #[test]
     fn canonical_url_origins_are_mapped_to_v8_origin_groups_and_isolated_realms() {

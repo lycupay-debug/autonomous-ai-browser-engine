@@ -6,7 +6,7 @@ A FreeBSD-native, AI-first browser engine research and development project.
 
 This repository is in **Phase 0: technical feasibility research**. It is not a usable browser and does not claim Web compatibility. The project owner has selected V8 15.6.75.19 as the primary JavaScript Runtime; Phase 0 still has open security and integration exit conditions.
 
-The current V8 FFI PoC models host-issued origin groups separately from JavaScript Realms. Same-origin Realms can use a transferred native DOM wrapper; cross-origin access is rejected at the native wrapper boundary. This is a narrow in-process host-object policy experiment, not a complete web-origin implementation, site-isolation architecture, or Renderer Sandbox. See `docs/phase-0/README.md` for evidence and limitations.
+The current V8 FFI PoC models host-issued origin groups separately from JavaScript Realms. Same-origin Realms can use a transferred native DOM wrapper; cross-origin access is rejected at the native wrapper boundary. Browser Navigation now initializes a minimal `document` placeholder with a native Node root only in Document Realms, and exposes a Document-scoped evaluation entry point; Worker Realms remain without `document`. This is a narrow lifecycle integration experiment, not a standards-compliant DOM, HTML parser, web-origin implementation, site-isolation architecture, or Renderer Sandbox. See `docs/phase-0/README.md` for evidence and limitations.
 
 ## Principles
 
@@ -25,7 +25,7 @@ The current V8 FFI PoC models host-issued origin groups separately from JavaScri
 - `experiments/js-runtime/native-embed/`: FreeBSD V8 and SpiderMonkey C++ embedding PoCs.
 - `experiments/js-runtime/ffi-poc/`: Rust-owned RAII wrappers over native V8 and SpiderMonkey C ABI.
 - `experiments/origin-policy/`: host-owned URL-origin canonicalization and opaque origin-group registry PoC.
-- `experiments/browser-runtime/`: orchestration PoC mapping canonical origin groups to JS Runtime origin handles and Realm lifetimes.
+- `experiments/browser-runtime/`: orchestration PoC mapping canonical origin groups to JS Runtime origin handles, Document/Frame/Worker lifetimes, minimal Document host initialization and Document-scoped script evaluation.
 - `experiments/js-runtime/benchmarks/`: common cross-runtime JavaScript microbenchmark.
 - `experiments/security/`: FreeBSD Capsicum, per-origin storage descriptor, crash-recovery, peer-credential and Jail network-isolation PoCs.
 - `experiments/headless/raster-poc/`: OpenType shaping, CPU glyph rasterization and PNG/JPEG/GIF/WebP decode PoC.

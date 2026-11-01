@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use aibe_js_runtime_ffi_poc::{JsRealmId, JsRuntime, JsRuntimeError, JsValue};
 use aibe_origin_policy_poc::OriginGroupId;
 
 use crate::{BrowserRuntimeOriginError, OriginRealmCoordinator, OriginRealmRuntime};
@@ -63,6 +64,10 @@ pub enum NavigationMode {
 #[derive(Debug)]
 pub enum NavigationError<E> {
     Coordinator(BrowserRuntimeOriginError<E>),
+    DocumentInitializationCleanupFailed {
+        initialization: BrowserRuntimeOriginError<E>,
+        cleanup: BrowserRuntimeOriginError<E>,
+    },
     UnknownFrame,
     UnknownDocument,
     UnknownNavigation,
@@ -80,6 +85,13 @@ impl<E: fmt::Display> fmt::Display for NavigationError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Coordinator(error) => write!(formatter, "navigation coordinator error: {error}"),
+            Self::DocumentInitializationCleanupFailed {
+                initialization,
+                cleanup,
+            } => write!(
+                formatter,
+                "Document initialization failed ({initialization}); candidate Realm cleanup also failed ({cleanup})"
+            ),
             Self::UnknownFrame => formatter.write_str("unknown Frame"),
             Self::UnknownDocument => formatter.write_str("unknown Document"),
             Self::UnknownNavigation => formatter.write_str("unknown Navigation"),
@@ -211,11 +223,34 @@ pub struct NavigationController<R: OriginRealmRuntime> {
     documents: HashMap<DocumentId, Document<R>>,
     navigations: HashMap<NavigationId, Navigation<R>>,
     workers: HashMap<WorkerId, DedicatedWorker<R>>,
+    pending_document_cleanup: Vec<R::Realm>,
     next_frame_id: u64,
     next_document_id: u64,
     next_navigation_id: u64,
     next_worker_id: u64,
     max_redirects: usize,
+}
+
+impl<R: OriginRealmRuntime<Realm = JsRealmId, Error = JsRuntimeError> + JsRuntime>
+    NavigationController<R>
+{
+    /// Evaluates source only in the live Realm owned by the requested Document.
+    /// Pending navigation candidates and Dedicated Worker Realms are not exposed
+    /// through this Document-scoped entry point.
+    pub fn evaluate_document_value(
+        &mut self,
+        document: DocumentId,
+        source: &str,
+    ) -> Result<JsValue, NavigationError<R::Error>> {
+        let realm = self
+            .documents
+            .get(&document)
+            .ok_or(NavigationError::UnknownDocument)?
+            .realm;
+        self.coordinator
+            .evaluate_value_in_realm(realm, source)
+            .map_err(Into::into)
+    }
 }
 
 impl<R: OriginRealmRuntime> NavigationController<R> {
@@ -233,6 +268,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             documents: HashMap::new(),
             navigations: HashMap::new(),
             workers: HashMap::new(),
+            pending_document_cleanup: Vec::new(),
             next_frame_id: 1,
             next_document_id: 1,
             next_navigation_id: 1,
@@ -244,7 +280,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
     pub fn create_root_frame(&mut self, url: &str) -> Result<FrameId, NavigationError<R::Error>> {
         let frame = self.allocate_frame_id()?;
         let document = self.allocate_document_id()?;
-        let realm = self.coordinator.create_realm_for_url(url)?;
+        let realm = self.create_document_realm(url, NavigationMode::Url, None)?;
         let origin = match self.coordinator.origin_group_for_realm(realm) {
             Some(origin) => origin,
             None => {
@@ -298,7 +334,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         };
         let frame = self.allocate_frame_id()?;
         let document = self.allocate_document_id()?;
-        let realm = self.create_realm(url, mode, Some(parent_realm))?;
+        let realm = self.create_document_realm(url, mode, Some(parent_realm))?;
         let origin = match self.coordinator.origin_group_for_realm(realm) {
             Some(origin) => origin,
             None => {
@@ -366,7 +402,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             }
         };
         let id = self.allocate_navigation_id()?;
-        let target_realm = self.create_realm(url, mode, creator_realm)?;
+        let target_realm = self.create_document_realm(url, mode, creator_realm)?;
         let target_origin = match self.coordinator.origin_group_for_realm(target_realm) {
             Some(origin) => origin,
             None => {
@@ -420,7 +456,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
         if current.redirect_count >= self.max_redirects {
             return Err(NavigationError::RedirectLimit);
         }
-        let target_realm = self.coordinator.create_realm_for_url(url)?;
+        let target_realm = self.create_document_realm(url, NavigationMode::Url, None)?;
         let target_origin = match self.coordinator.origin_group_for_realm(target_realm) {
             Some(origin) => origin,
             None => {
@@ -748,6 +784,58 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             return Err(NavigationError::InheritedOriginRequiresAboutUrl);
         }
         Ok(())
+    }
+
+    /// Creates a Realm and installs its minimal Document host surface before
+    /// the Realm can become a current or pending browser Document. Worker
+    /// Realms deliberately use `create_realm` directly and receive no Document.
+    fn create_document_realm(
+        &mut self,
+        url: &str,
+        mode: NavigationMode,
+        creator_realm: Option<R::Realm>,
+    ) -> Result<R::Realm, NavigationError<R::Error>> {
+        let realm = self.create_realm(url, mode, creator_realm)?;
+        if let Err(initialization) = self.coordinator.initialize_document(realm) {
+            // Do not publish a partially initialized Document Realm. If native
+            // cleanup also fails, retain the handle for an explicit retry.
+            return match self.coordinator.destroy_realm(realm) {
+                Ok(()) => Err(NavigationError::Coordinator(initialization)),
+                Err(cleanup) => {
+                    self.pending_document_cleanup.push(realm);
+                    Err(NavigationError::DocumentInitializationCleanupFailed {
+                        initialization,
+                        cleanup,
+                    })
+                }
+            };
+        }
+        Ok(realm)
+    }
+
+    /// Retries cleanup for candidate Realms whose Document initialization and
+    /// immediate teardown both failed. Successfully destroyed handles are removed.
+    pub fn retry_document_initialization_cleanup(
+        &mut self,
+    ) -> Result<usize, NavigationError<R::Error>> {
+        let pending = std::mem::take(&mut self.pending_document_cleanup);
+        let mut cleaned = 0;
+        let mut first_error = None;
+        for realm in pending {
+            match self.coordinator.destroy_realm(realm) {
+                Ok(()) => cleaned += 1,
+                Err(error) => {
+                    self.pending_document_cleanup.push(realm);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(NavigationError::Coordinator(error));
+        }
+        Ok(cleaned)
     }
 
     fn create_realm(

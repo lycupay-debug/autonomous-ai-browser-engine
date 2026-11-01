@@ -494,3 +494,29 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - HTTP/1.1 GET only. No HTTP/2/3, compression, cookies, cache, CORS/Fetch semantics, request methods/bodies, streaming API, cancellation propagation, download broker, or persistent connection pool.
 - The Network Policy PoC is not connected to NavigationController, HTML Parser, Worker script execution, or a production Network Service. No browser document was parsed from the retrieved body.
 - The 8 MiB body limit and chunk limits are Phase 0 safety bounds, not final product resource budgets.
+
+
+## Incremental R&D record｜2026-11-01（Document Realm initialization and Navigation integration）
+
+### Implementation
+
+- Added `JsRuntime::initialize_document(realm)` as an explicit host lifecycle hook. The V8 adapter installs a minimal `document` object (`nodeType: 9`) with a native Node-backed `documentElement`.
+- `NavigationController` initializes the host Document surface for root Frames, child Frames (inherited and sandboxed), navigation candidates and redirect replacement Realms. Dedicated Worker Realms intentionally do not receive a `document` global.
+- Added `evaluate_document_value(document_id, source)`, which only resolves a currently owned Document and evaluates in its Realm. Pending candidates, removed Documents, and Worker Realms are not reachable through this entry point.
+- Initialization failure destroys the unpublished candidate Realm. If immediate destruction also fails, the Realm handle is retained and surfaced as `DocumentInitializationCleanupFailed`; `retry_document_initialization_cleanup()` retries it instead of silently dropping the handle.
+- Added V8 integration coverage for root/child Document initialization, script evaluation, navigation commit replacement, and invalidation of outgoing parent/child Documents. Mock-runtime tests cover root/child initialization, redirect replacement, Worker exclusion, initialization failure, and cleanup retry.
+
+### Verification
+
+- Browser Runtime: 34/34 tests passed, including the new V8 Navigation integration test.
+- V8 FFI: 22/22 tests passed.
+- Full FreeBSD workspace: 141/141 tests passed.
+- Workspace Clippy `-D warnings`, Rustfmt, `git diff --check`, complete security PoC suite, Python/shell syntax checks and all eight SBOM validator fixtures passed.
+- Verification used `AIBE_RUNTIME_PREFIX` unset and `LD_LIBRARY_PATH=/tmp/aibe-runtime-root/usr/local/lib` for the native V8 runtime.
+
+### Limits
+
+- The current `document` is a JavaScript placeholder object, not a standards-compliant `Document`; `Node` remains the narrow native DOM-like PoC, not a complete DOM or Web IDL implementation.
+- No HTML parsing, HTML-to-DOM construction, Window/Location/History, lifecycle event dispatch, CSS, layout, form controls, MutationObserver, HTML Event Loop, or browser task scheduling is implemented.
+- `evaluate_document_value` is a Phase 0 host-side entry point, not the final AI Control protocol or a production script-execution security model.
+- No production service, persistent FreeBSD configuration, sysctl, or host service state was changed.

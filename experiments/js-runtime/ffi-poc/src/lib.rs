@@ -39,6 +39,11 @@ pub trait JsRuntime {
     fn create_origin(&mut self) -> Result<JsOriginId, JsRuntimeError>;
     fn create_realm(&mut self) -> Result<JsRealmId, JsRuntimeError>;
     fn create_realm_for_origin(&mut self, origin: JsOriginId) -> Result<JsRealmId, JsRuntimeError>;
+    /// Initializes the minimal host Document surface for a browser Document Realm.
+    /// Non-browser runtimes may keep the default no-op until they implement DOM bindings.
+    fn initialize_document(&mut self, _realm: JsRealmId) -> Result<(), JsRuntimeError> {
+        Ok(())
+    }
     fn destroy_realm(&mut self, realm: JsRealmId) -> Result<(), JsRuntimeError>;
     fn evaluate_value_in_realm(
         &mut self,
@@ -716,6 +721,17 @@ mod native {
             V8Runtime::create_realm_for_origin(self, origin)
         }
 
+        fn initialize_document(
+            &mut self,
+            realm: super::JsRealmId,
+        ) -> Result<(), super::JsRuntimeError> {
+            self.eval_value_in_realm(
+                realm,
+                "globalThis.document = { nodeType: 9, documentElement: new Node() };",
+            )
+            .map(|_| ())
+        }
+
         fn destroy_realm(&mut self, realm: super::JsRealmId) -> Result<(), super::JsRuntimeError> {
             V8Runtime::destroy_realm(self, realm)
         }
@@ -1203,6 +1219,51 @@ mod tests {
             .destroy_realm(second)
             .expect("second realm is destroyed");
         assert_eq!(runtime.destroy_realm(second).unwrap_err().code, -9);
+    }
+
+    #[test]
+    fn v8_initializes_a_minimal_document_and_native_node_root_per_realm() {
+        use super::{JsRuntime, JsValue};
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        let origin = runtime.create_origin().expect("origin created");
+        let document_realm = runtime
+            .create_realm_for_origin(origin)
+            .expect("Document Realm created");
+        runtime
+            .initialize_document(document_realm)
+            .expect("minimal Document surface initialized");
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(document_realm, "document.nodeType")
+                .unwrap(),
+            JsValue::Number(9.0)
+        );
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(document_realm, "document.documentElement instanceof Node")
+                .unwrap(),
+            JsValue::Boolean(true)
+        );
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(
+                    document_realm,
+                    "document.documentElement.appendChild(new Node()); document.documentElement.childCount()",
+                )
+                .unwrap(),
+            JsValue::Number(1.0)
+        );
+
+        let worker_realm = runtime
+            .create_realm_for_origin(origin)
+            .expect("second Realm created");
+        assert_eq!(
+            runtime
+                .eval_value_in_realm(worker_realm, "typeof document")
+                .unwrap(),
+            JsValue::String("undefined".into()),
+            "a Realm does not receive a Document unless the host initializes it"
+        );
     }
 
     #[test]
