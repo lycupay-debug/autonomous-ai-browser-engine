@@ -13,7 +13,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cppgc/allocation.h>
+#include <cppgc/member.h>
 #include <libplatform/libplatform.h>
+#include <v8-cppgc.h>
+#include <v8-sandbox.h>
 #include <v8.h>
 
 namespace {
@@ -429,6 +433,168 @@ bool install_node_class(AibeV8Runtime* runtime, v8::Local<v8::Context> context)
         ->Set(context, v8::String::NewFromUtf8Literal(isolate, "Node"), constructor)
         .FromMaybe(false);
 }
+std::atomic<size_t> g_finalized_cppgc_nodes{0};
+constexpr auto kAibeCppGcNodeTag = v8::CppHeapPointerTag::kFirstEmbedderWrappableTag;
+
+struct AibeCppGcListener {
+    std::string type;
+    v8::TracedReference<v8::Function> callback;
+};
+
+// Separate feasibility prototype for V8's unified V8/CppHeap tracing.
+// This intentionally does not replace the existing shared_ptr DOM PoC.
+class AibeCppGcNode final : public v8::Object::Wrappable {
+public:
+    cppgc::Member<AibeCppGcNode> child;
+    std::vector<AibeCppGcListener> listeners;
+
+    ~AibeCppGcNode() override
+    {
+        g_finalized_cppgc_nodes.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void Trace(cppgc::Visitor* visitor) const override
+    {
+        v8::Object::Wrappable::Trace(visitor);
+        visitor->Trace(child);
+        for (const auto& listener : listeners) {
+            visitor->Trace(listener.callback);
+        }
+    }
+};
+
+AibeCppGcNode* cppgc_node_from(
+    v8::Isolate* isolate,
+    v8::Local<v8::Object> object)
+{
+    return v8::Object::Unwrap<kAibeCppGcNodeTag, AibeCppGcNode>(isolate, object);
+}
+
+void cppgc_node_constructor(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* heap = isolate->GetCppHeap();
+    if (heap == nullptr) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "CppHeap is not attached")));
+        return;
+    }
+    auto* node = cppgc::MakeGarbageCollected<AibeCppGcNode>(heap->GetAllocationHandle());
+    v8::Object::Wrap<kAibeCppGcNodeTag>(isolate, info.This(), node);
+    info.GetReturnValue().Set(info.This());
+}
+
+void cppgc_node_add_event_listener(
+    const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* node = cppgc_node_from(isolate, info.This());
+    if (node == nullptr || info.Length() < 2 || !info[0]->IsString()
+        || !info[1]->IsFunction()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "addEventListener requires a type and callback")));
+        return;
+    }
+    v8::String::Utf8Value type(isolate, info[0]);
+    if (*type == nullptr || type.length() > 256) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "event type exceeds 256 UTF-8 bytes")));
+        return;
+    }
+    if (node->listeners.size() >= 1024) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(isolate, "Node listener limit exceeded")));
+        return;
+    }
+    AibeCppGcListener listener;
+    listener.type.assign(*type, static_cast<size_t>(type.length()));
+    listener.callback.Reset(isolate, info[1].As<v8::Function>());
+    node->listeners.push_back(std::move(listener));
+}
+
+void cppgc_node_append_child(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* parent = cppgc_node_from(isolate, info.This());
+    if (parent == nullptr || info.Length() < 1 || !info[0]->IsObject()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "appendChild requires a Node")));
+        return;
+    }
+    auto* child = cppgc_node_from(isolate, info[0].As<v8::Object>());
+    if (child == nullptr || child == parent) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "appendChild received an invalid Node")));
+        return;
+    }
+    parent->child = child;
+    info.GetReturnValue().Set(info[0]);
+}
+
+void cppgc_node_child_count(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* node = cppgc_node_from(isolate, info.This());
+    if (node == nullptr) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "childCount receiver is not a Node")));
+        return;
+    }
+    info.GetReturnValue().Set(v8::Integer::New(isolate, node->child == nullptr ? 0 : 1));
+}
+
+bool install_cppgc_node_class(
+    v8::Isolate* isolate,
+    v8::Local<v8::Context> context)
+{
+    auto node_template = v8::FunctionTemplate::New(isolate, cppgc_node_constructor);
+    node_template->SetClassName(v8::String::NewFromUtf8Literal(isolate, "CppGcNode"));
+    node_template->PrototypeTemplate()->Set(
+        isolate, "addEventListener",
+        v8::FunctionTemplate::New(isolate, cppgc_node_add_event_listener));
+    node_template->PrototypeTemplate()->Set(
+        isolate, "appendChild",
+        v8::FunctionTemplate::New(isolate, cppgc_node_append_child));
+    node_template->PrototypeTemplate()->Set(
+        isolate, "childCount",
+        v8::FunctionTemplate::New(isolate, cppgc_node_child_count));
+    v8::Local<v8::Function> constructor;
+    if (!node_template->GetFunction(context).ToLocal(&constructor)) {
+        return false;
+    }
+    return context->Global()
+        ->Set(context, v8::String::NewFromUtf8Literal(isolate, "CppGcNode"), constructor)
+        .FromMaybe(false);
+}
+
+bool run_cppgc_cycle_script(v8::Isolate* isolate)
+{
+    v8::Isolate::Scope isolate_scope(isolate);
+    v8::HandleScope handle_scope(isolate);
+    auto context = v8::Context::New(isolate);
+    if (context.IsEmpty()) {
+        return false;
+    }
+    v8::Context::Scope context_scope(context);
+    if (!install_cppgc_node_class(isolate, context)) {
+        return false;
+    }
+
+    auto source = v8::String::NewFromUtf8Literal(
+        isolate,
+        "globalThis.cycleRoot = new CppGcNode(); "
+        "(() => { const root = cycleRoot; const child = new CppGcNode(); "
+        "root.appendChild(child); "
+        "child.addEventListener('cycle', () => child.childCount()); })(); "
+        "cycleRoot = null;");
+    v8::Local<v8::Script> script;
+    if (!v8::Script::Compile(context, source).ToLocal(&script)) {
+        return false;
+    }
+    v8::Local<v8::Value> result;
+    return script->Run(context).ToLocal(&result);
+}
+
 } // namespace
 
 extern "C" void* aibe_v8_create()
@@ -558,6 +724,51 @@ extern "C" int aibe_v8_force_gc(void* opaque)
     PendingNodeReleaseScope pending_release_scope{runtime};
     runtime->isolate->LowMemoryNotification();
     return 0;
+}
+
+extern "C" int aibe_v8_cppgc_cycle_probe()
+{
+    if (!initialize_v8_once("/usr/local/bin/d8")) {
+        return -1;
+    }
+
+    auto cpp_heap = v8::CppHeap::Create(
+        g_v8_platform, v8::CppHeapCreateParams({}));
+    if (!cpp_heap) {
+        return -2;
+    }
+
+    auto allocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    if (!allocator) {
+        return -3;
+    }
+
+    v8::Isolate::CreateParams params;
+    params.array_buffer_allocator = allocator.get();
+    params.cpp_heap = cpp_heap.release();
+    auto* isolate = v8::Isolate::New(params);
+    if (isolate == nullptr) {
+        return -4;
+    }
+    isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+
+    const size_t before = g_finalized_cppgc_nodes.load(std::memory_order_relaxed);
+    const bool script_ok = run_cppgc_cycle_script(isolate);
+    if (script_ok) {
+        v8::Isolate::Scope isolate_scope(isolate);
+        // LowMemoryNotification requests a full collection without requiring
+        // the embedder to enable the JavaScript --expose-gc flag.
+        isolate->LowMemoryNotification();
+        isolate->GetCppHeap()->FinishSweepingForTesting();
+    }
+
+    const size_t after = g_finalized_cppgc_nodes.load(std::memory_order_relaxed);
+    isolate->Dispose();
+    if (!script_ok) {
+        return -5;
+    }
+    return after > before ? static_cast<int>(after - before) : 0;
 }
 
 extern "C" size_t aibe_v8_finalized_dom_wrapper_count()

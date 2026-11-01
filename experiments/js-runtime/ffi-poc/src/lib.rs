@@ -53,6 +53,8 @@ mod native {
         fn aibe_v8_run_microtasks(handle: *mut c_void) -> c_int;
         fn aibe_v8_force_gc(handle: *mut c_void) -> c_int;
         fn aibe_v8_finalized_dom_wrapper_count() -> usize;
+        #[cfg(test)]
+        pub(super) fn aibe_v8_cppgc_cycle_probe() -> c_int;
         fn aibe_v8_destroy(handle: *mut c_void) -> c_int;
         fn aibe_spidermonkey_create() -> *mut c_void;
         fn aibe_spidermonkey_eval(
@@ -73,6 +75,11 @@ mod native {
 
     /// Comparison-only SpiderMonkey wrapper. Not the selected production path.
     pub struct SpiderMonkeyRuntime(NonNull<c_void>);
+
+    #[cfg(test)]
+    pub fn cppgc_cycle_probe() -> i32 {
+        unsafe { aibe_v8_cppgc_cycle_probe() }
+    }
 
     impl V8Runtime {
         pub fn new() -> Result<Self, &'static str> {
@@ -175,6 +182,8 @@ mod native {
     }
 }
 
+#[cfg(all(test, target_os = "freebsd"))]
+pub(crate) use native::cppgc_cycle_probe;
 #[cfg(target_os = "freebsd")]
 pub use native::{SpiderMonkeyRuntime, V8Runtime};
 
@@ -360,6 +369,15 @@ mod tests {
                 .eval("(() => { const node = new Node(); node.addEventListener('error', () => { throw new Error('listener failure'); }); try { node.dispatchEvent('error'); return 'exception-swallowed'; } catch (error) { return error.message; } })()")
                 .expect("listener exception remains visible to the script caller"),
             "listener failure"
+        );
+    }
+
+    #[test]
+    fn v8_cppgc_unifies_native_and_javascript_callback_cycles() {
+        let finalized = super::cppgc_cycle_probe();
+        assert!(
+            finalized >= 2,
+            "CppHeap should collect a native Node -> traced JS callback -> JS wrapper -> native Node cycle"
         );
     }
 
