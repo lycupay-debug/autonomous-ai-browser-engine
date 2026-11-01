@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -37,15 +40,32 @@ bool initialize_v8_once(const char* executable)
 
 struct AibeV8Runtime;
 
+struct AibeEventListener {
+    uint64_t id;
+    std::string type;
+    v8::Global<v8::Function> callback;
+};
+
 struct AibeNativeNode {
     std::vector<std::shared_ptr<AibeNativeNode>> children;
     std::weak_ptr<AibeNativeNode> parent;
+    std::vector<AibeEventListener> listeners;
+    uint64_t next_listener_id = 1;
+
+    // Persistent V8 callback handles must be released before the isolate dies.
+    ~AibeNativeNode()
+    {
+        for (auto& listener : listeners) {
+            listener.callback.Reset();
+        }
+    }
 };
 
 struct AibeNodeWrapper {
     AibeV8Runtime* owner;
     std::shared_ptr<AibeNativeNode> node;
     v8::Global<v8::Object> object;
+    AibeNodeWrapper* pending_next = nullptr;
 };
 
 struct AibeV8Runtime {
@@ -56,10 +76,29 @@ struct AibeV8Runtime {
     v8::Global<v8::FunctionTemplate> node_template;
     // Weak per-runtime identity cache: it must not keep JS wrappers alive.
     std::unordered_map<AibeNativeNode*, AibeNodeWrapper*> node_wrappers;
+    // Weak callbacks only enqueue wrappers; native/V8 handle destruction is
+    // deferred until the isolate has left the GC callback phase.
+    AibeNodeWrapper* pending_node_releases = nullptr;
 };
 
 namespace {
 std::atomic<size_t> g_finalized_dom_wrappers{0};
+
+void drain_pending_node_releases(AibeV8Runtime* runtime)
+{
+    auto* wrapper = runtime->pending_node_releases;
+    runtime->pending_node_releases = nullptr;
+    while (wrapper != nullptr) {
+        auto* next = wrapper->pending_next;
+        delete wrapper;
+        wrapper = next;
+    }
+}
+
+struct PendingNodeReleaseScope {
+    AibeV8Runtime* runtime;
+    ~PendingNodeReleaseScope() { drain_pending_node_releases(runtime); }
+};
 
 AibeNodeWrapper* node_wrapper_from(v8::Local<v8::Object> object)
 {
@@ -78,9 +117,11 @@ void node_wrapper_weak_callback(const v8::WeakCallbackInfo<AibeNodeWrapper>& inf
 {
     auto* wrapper = info.GetParameter();
     wrapper->object.Reset();
-    wrapper->owner->node_wrappers.erase(wrapper->node.get());
+    auto* owner = wrapper->owner;
+    owner->node_wrappers.erase(wrapper->node.get());
+    wrapper->pending_next = owner->pending_node_releases;
+    owner->pending_node_releases = wrapper;
     g_finalized_dom_wrappers.fetch_add(1, std::memory_order_relaxed);
-    delete wrapper;
 }
 
 // Attach one JS object to a native Node and register its weak identity entry.
@@ -183,6 +224,135 @@ void node_append_child(const v8::FunctionCallbackInfo<v8::Value>& info)
     info.GetReturnValue().Set(info[0]);
 }
 
+void node_add_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* wrapper = node_wrapper_from(info.This());
+    if (wrapper == nullptr || info.Length() < 2 || !info[0]->IsString()
+        || !info[1]->IsFunction()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "addEventListener requires a type and callback")));
+        return;
+    }
+
+    v8::String::Utf8Value event_type(isolate, info[0]);
+    if (*event_type == nullptr || event_type.length() > 256) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "event type must not exceed 256 UTF-8 bytes")));
+        return;
+    }
+    const std::string type(*event_type, static_cast<size_t>(event_type.length()));
+    auto callback = info[1].As<v8::Function>();
+    for (const auto& listener : wrapper->node->listeners) {
+        if (listener.type == type && listener.callback.Get(isolate)->StrictEquals(callback)) {
+            return;
+        }
+    }
+
+    if (wrapper->node->listeners.size() >= 1024) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(isolate, "Node listener limit exceeded")));
+        return;
+    }
+
+    if (wrapper->node->next_listener_id == 0) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(isolate, "Node listener identifier space exhausted")));
+        return;
+    }
+
+    AibeEventListener listener;
+    listener.id = wrapper->node->next_listener_id++;
+    listener.type = type;
+    listener.callback.Reset(isolate, callback);
+    wrapper->node->listeners.push_back(std::move(listener));
+}
+
+void node_remove_event_listener(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* wrapper = node_wrapper_from(info.This());
+    if (wrapper == nullptr || info.Length() < 2 || !info[0]->IsString()
+        || !info[1]->IsFunction()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "removeEventListener requires a type and callback")));
+        return;
+    }
+
+    v8::String::Utf8Value event_type(isolate, info[0]);
+    if (*event_type == nullptr) {
+        return;
+    }
+    if (event_type.length() > 256) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "event type exceeds 256 UTF-8 bytes")));
+        return;
+    }
+    const std::string type(*event_type, static_cast<size_t>(event_type.length()));
+    auto callback = info[1].As<v8::Function>();
+    auto& listeners = wrapper->node->listeners;
+    listeners.erase(
+        std::remove_if(listeners.begin(), listeners.end(), [&](AibeEventListener& listener) {
+            if (listener.type != type || !listener.callback.Get(isolate)->StrictEquals(callback)) {
+                return false;
+            }
+            listener.callback.Reset();
+            return true;
+        }),
+        listeners.end());
+}
+
+void node_dispatch_event(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* wrapper = node_wrapper_from(info.This());
+    if (wrapper == nullptr || info.Length() < 1 || !info[0]->IsString()) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "dispatchEvent requires an event type string")));
+        return;
+    }
+
+    v8::String::Utf8Value event_type(isolate, info[0]);
+    if (*event_type == nullptr) {
+        return;
+    }
+    const std::string type(*event_type, static_cast<size_t>(event_type.length()));
+
+    // Snapshot callbacks before invoking script: listeners may add or remove
+    // listeners re-entrantly, invalidating the native vector during dispatch.
+    std::vector<std::pair<uint64_t, v8::Local<v8::Function>>> callbacks;
+    for (const auto& listener : wrapper->node->listeners) {
+        if (listener.type == type) {
+            callbacks.emplace_back(listener.id, listener.callback.Get(isolate));
+        }
+    }
+
+    auto context = isolate->GetCurrentContext();
+    auto event_value = v8::String::NewFromUtf8(
+        isolate, type.c_str(), v8::NewStringType::kNormal,
+        static_cast<int>(type.size())).ToLocalChecked();
+    v8::Local<v8::Value> arguments[] = {event_value};
+    int invoked = 0;
+    for (const auto& [listener_id, callback] : callbacks) {
+        // A listener removed by an earlier callback in this dispatch must not
+        // run later in the same dispatch; newly added listeners are not in the snapshot.
+        const bool still_registered = std::any_of(
+            wrapper->node->listeners.begin(),
+            wrapper->node->listeners.end(),
+            [listener_id](const AibeEventListener& listener) {
+                return listener.id == listener_id;
+            });
+        if (!still_registered) {
+            continue;
+        }
+        if (callback->Call(context, info.This(), 1, arguments).IsEmpty()) {
+            return;
+        }
+        ++invoked;
+    }
+    info.GetReturnValue().Set(v8::Integer::New(isolate, invoked));
+}
+
 void node_child_count(const v8::FunctionCallbackInfo<v8::Value>& info)
 {
     auto* isolate = info.GetIsolate();
@@ -235,6 +405,18 @@ bool install_node_class(AibeV8Runtime* runtime, v8::Local<v8::Context> context)
         isolate,
         "childCount",
         v8::FunctionTemplate::New(isolate, node_child_count));
+    node_template->PrototypeTemplate()->Set(
+        isolate,
+        "addEventListener",
+        v8::FunctionTemplate::New(isolate, node_add_event_listener));
+    node_template->PrototypeTemplate()->Set(
+        isolate,
+        "removeEventListener",
+        v8::FunctionTemplate::New(isolate, node_remove_event_listener));
+    node_template->PrototypeTemplate()->Set(
+        isolate,
+        "dispatchEvent",
+        v8::FunctionTemplate::New(isolate, node_dispatch_event));
     node_template->PrototypeTemplate()->Set(
         isolate,
         "firstChild",
@@ -318,6 +500,7 @@ extern "C" int aibe_v8_eval(
         return -8;
     }
     v8::Context::Scope context_scope(context);
+    PendingNodeReleaseScope pending_release_scope{runtime};
     v8::TryCatch try_catch(runtime->isolate);
 
     v8::Local<v8::String> text;
@@ -357,6 +540,7 @@ extern "C" int aibe_v8_run_microtasks(void* opaque)
         return -7;
     }
     v8::Isolate::Scope isolate_scope(runtime->isolate);
+    PendingNodeReleaseScope pending_release_scope{runtime};
     runtime->isolate->PerformMicrotaskCheckpoint();
     return 0;
 }
@@ -371,6 +555,7 @@ extern "C" int aibe_v8_force_gc(void* opaque)
         return -7;
     }
     v8::Isolate::Scope isolate_scope(runtime->isolate);
+    PendingNodeReleaseScope pending_release_scope{runtime};
     runtime->isolate->LowMemoryNotification();
     return 0;
 }
@@ -389,14 +574,18 @@ extern "C" int aibe_v8_destroy(void* opaque)
     if (std::this_thread::get_id() != runtime->owner_thread) {
         return -7;
     }
-    runtime->context.Reset();
-    runtime->node_template.Reset();
-    for (const auto& entry : runtime->node_wrappers) {
-        auto* wrapper = entry.second;
-        wrapper->object.Reset();
-        delete wrapper;
+    {
+        v8::Isolate::Scope isolate_scope(runtime->isolate);
+        drain_pending_node_releases(runtime);
+        runtime->context.Reset();
+        runtime->node_template.Reset();
+        for (const auto& entry : runtime->node_wrappers) {
+            auto* wrapper = entry.second;
+            wrapper->object.Reset();
+            delete wrapper;
+        }
+        runtime->node_wrappers.clear();
     }
-    runtime->node_wrappers.clear();
     runtime->isolate->Dispose();
     runtime->isolate = nullptr;
     delete runtime;

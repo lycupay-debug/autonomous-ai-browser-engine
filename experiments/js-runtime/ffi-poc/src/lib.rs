@@ -315,6 +315,55 @@ mod tests {
     }
 
     #[test]
+    fn v8_dom_event_listeners_retain_callbacks_across_wrapper_collection() {
+        let before = V8Runtime::finalized_dom_wrapper_count();
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+
+        runtime
+            .eval("globalThis.eventRoot = new Node(); globalThis.eventCalls = 0; (() => { const child = new Node(); const captured = 41; child.addEventListener('ping', type => { eventCalls = captured + (type === 'ping' ? 1 : 0); }); eventRoot.appendChild(child); })();")
+            .expect("native node stores a callback closure");
+
+        runtime
+            .collect_garbage()
+            .expect("unreachable child wrapper can be collected");
+        assert!(
+            V8Runtime::finalized_dom_wrapper_count() > before,
+            "child JS wrapper should be collected while its native node remains attached"
+        );
+
+        assert_eq!(
+            runtime
+                .eval("eventRoot.firstChild().dispatchEvent('ping') + ':' + eventCalls")
+                .expect("native listener callback survives wrapper collection"),
+            "1:42"
+        );
+
+        assert_eq!(
+            runtime
+                .eval("(() => { const node = eventRoot.firstChild(); const callback = () => { eventCalls += 100; }; node.addEventListener('once', callback); node.removeEventListener('once', callback); return node.dispatchEvent('once'); })()")
+                .expect("listener removal prevents future dispatch"),
+            "0"
+        );
+    }
+
+    #[test]
+    fn v8_dom_event_dispatch_handles_reentrant_listener_mutation() {
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+        assert_eq!(
+            runtime
+                .eval("(() => { const node = new Node(); let removedCalls = 0; const removed = () => removedCalls++; node.addEventListener('remove', () => node.removeEventListener('remove', removed)); node.addEventListener('remove', removed); const removeCount = node.dispatchEvent('remove'); let lateCalls = 0; let added = false; const late = () => lateCalls++; const addDuringDispatch = () => { if (!added) { added = true; node.addEventListener('add', late); } }; node.addEventListener('add', addDuringDispatch); node.addEventListener('add', addDuringDispatch); const firstAddCount = node.dispatchEvent('add'); const secondAddCount = node.dispatchEvent('add'); return [removeCount, removedCalls, firstAddCount, secondAddCount, lateCalls].join(':'); })()")
+                .expect("dispatch snapshots tolerate reentrant listener mutation"),
+            "1:0:1:2:1"
+        );
+        assert_eq!(
+            runtime
+                .eval("(() => { const node = new Node(); node.addEventListener('error', () => { throw new Error('listener failure'); }); try { node.dispatchEvent('error'); return 'exception-swallowed'; } catch (error) { return error.message; } })()")
+                .expect("listener exception remains visible to the script caller"),
+            "listener failure"
+        );
+    }
+
+    #[test]
     fn v8_string_ffi_preserves_embedded_nul_bytes() {
         let mut v8 = V8Runtime::new().expect("V8 runtime initializes");
         assert_eq!(

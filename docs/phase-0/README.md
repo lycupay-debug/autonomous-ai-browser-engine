@@ -155,3 +155,13 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - Added tests for stable wrapper identity, `null` on an empty parent, GC of an unreachable child wrapper, and re-wrapping the still-attached native child.
 - FreeBSD V8 FFI tests: 10/10 passed. Full workspace tests: 47/47 passed (Boa 7, UDS 9, Headless 4, V8 FFI 10, Network 17). Formatting and Clippy with `-D warnings` passed.
 - Scope remains intentionally narrow: one Runtime/Context per cache. Cross-Realm/Agent wrapper semantics, listener-held JS closures, MutationObserver, navigation/Frame/Worker teardown, GC stress and resource quotas remain open.
+
+## DOM EventTarget lifecycle update — 2026-11-01
+
+- Added a minimal native Node listener store backed by V8 persistent callback handles. The native Node owns listener registrations, so a child node retained by its native parent can retain a callback after the child's JavaScript wrapper is collected.
+- Added `addEventListener(type, callback)`, `removeEventListener(type, callback)`, and `dispatchEvent(type)` for a deliberately limited event model. Event types are bounded to 256 UTF-8 bytes and each native Node is limited to 1,024 listeners.
+- Dispatch snapshots listener IDs before invoking JavaScript. Re-entrant removal suppresses a listener that has not yet run; listeners added during dispatch wait until the next dispatch. Duplicate registrations are ignored, and callback exceptions propagate to the caller.
+- Added deferred weak-finalizer cleanup: the V8 weak callback now only resets its own wrapper handle, removes the cache entry, and enqueues the native wrapper on an intrusive per-Runtime list. The wrapper and its native node are destroyed after the GC callback phase, avoiding destruction of other persistent V8 callback handles inside the weak callback.
+- FreeBSD V8 FFI tests: 12/12 passed. Full workspace tests: 49/49 passed (Boa 7, UDS 9, Headless 4, V8 FFI 12, Network 17). Formatting and Clippy with `-D warnings` passed. GitHub Actions Run 41266088154 passed both Rust and supply-chain jobs, including RustSec audit and CycloneDX SBOM generation/validation.
+- Important limitations: this is not a WHATWG DOM EventTarget implementation. It has no Event object, capture/bubble phases, propagation path, default actions, once/passive/signal options, or HTML event-loop integration. Callback handles are strong V8 roots; a listener closure that captures its own Node wrapper can create a cross-heap retention cycle. Embedder heap tracing or a different ownership design is required before treating this as production-safe DOM lifetime management.
+- Navigation, Frame/Worker teardown, cross-Realm wrapper semantics, MutationObserver, GC/heap stress, and resource quotas remain unimplemented.
