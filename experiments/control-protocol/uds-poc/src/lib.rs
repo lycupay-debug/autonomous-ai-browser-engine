@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+pub mod snapshot_endpoint;
 pub mod snapshot_frame;
 
 use serde_json::Value;
@@ -36,6 +37,111 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PeerCredentials {
     pub uid: u32,
     pub gid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerProcessCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Obtain the FreeBSD LOCAL_PEERCRED identity, including the kernel-reported
+/// peer PID. This is separate from getpeereid(), which reports only UID/GID.
+#[cfg(target_os = "freebsd")]
+pub fn peer_process_credentials(stream: &UnixStream) -> std::io::Result<PeerProcessCredentials> {
+    use std::ffi::{c_int, c_short, c_uint, c_void};
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    union XucredTail {
+        unused: *mut c_void,
+        pid: c_int,
+    }
+    #[repr(C)]
+    struct Xucred {
+        version: c_uint,
+        uid: c_uint,
+        ngroups: c_short,
+        groups: [c_uint; 16],
+        tail: XucredTail,
+    }
+    unsafe extern "C" {
+        fn getsockopt(
+            socket: c_int,
+            level: c_int,
+            option: c_int,
+            value: *mut c_void,
+            length: *mut u32,
+        ) -> c_int;
+        fn getpeereid(socket: c_int, euid: *mut u32, egid: *mut u32) -> c_int;
+    }
+
+    let mut credentials = Xucred {
+        version: 0,
+        uid: 0,
+        ngroups: 0,
+        groups: [0; 16],
+        tail: XucredTail { pid: 0 },
+    };
+    let mut length = std::mem::size_of::<Xucred>() as u32;
+    let result = unsafe {
+        getsockopt(
+            stream.as_raw_fd(),
+            0,
+            1,
+            (&mut credentials as *mut Xucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if std::mem::size_of::<Xucred>() != 88
+        || std::mem::offset_of!(Xucred, tail) != 80
+        || length as usize != std::mem::size_of::<Xucred>()
+        || credentials.version != 0
+        || credentials.ngroups < 1
+        || credentials.ngroups > 16
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "FreeBSD LOCAL_PEERCRED returned an unsupported xucred layout",
+        ));
+    }
+    let pid = unsafe { credentials.tail.pid };
+    if pid <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "FreeBSD LOCAL_PEERCRED returned an invalid peer PID",
+        ));
+    }
+    let mut uid = 0_u32;
+    let mut gid = 0_u32;
+    let verified = unsafe { getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if verified != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let gid_from_groups = credentials.groups[0];
+    if credentials.uid != uid || gid_from_groups != gid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "LOCAL_PEERCRED and getpeereid identity results disagree",
+        ));
+    }
+    Ok(PeerProcessCredentials {
+        pid: pid as u32,
+        uid,
+        gid,
+    })
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn peer_process_credentials(_stream: &UnixStream) -> std::io::Result<PeerProcessCredentials> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "peer process credentials require FreeBSD LOCAL_PEERCRED",
+    ))
 }
 
 /// Trusted local-peer identity policy. GID matching is optional for callers
@@ -90,7 +196,6 @@ pub fn peer_credentials(_stream: &UnixStream) -> std::io::Result<PeerCredentials
     ))
 }
 
-/// Authorize a UDS connection only when the kernel-reported peer UID matches.
 /// Authorize a UDS connection against kernel-reported UID and optional GID.
 pub fn authorize_peer(
     stream: &UnixStream,

@@ -394,6 +394,204 @@ impl GrantRegistry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SnapshotGrantId {
+    registry_id: u64,
+    sequence: u64,
+}
+
+impl SnapshotGrantId {
+    pub const fn value(self) -> u64 {
+        self.sequence
+    }
+    pub const fn registry_id(self) -> u64 {
+        self.registry_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotGrantRevocation {
+    RevokedBeforeUse,
+    AlreadyConsumed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotGrantError {
+    InvalidIdentity,
+    InvalidQuota,
+    QuotaExceeded(QuotaScope),
+    UnknownGrant,
+    WrongRenderer,
+    WrongOrigin,
+    WrongDocument,
+    StaleRevision,
+    Replay,
+    IdExhausted,
+}
+
+impl fmt::Display for SnapshotGrantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for SnapshotGrantError {}
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotGrantRecord {
+    renderer: RendererPrincipal,
+    origin: OriginGroupId,
+    document_id: u64,
+    revision: u64,
+    consumed: bool,
+}
+
+/// Broker-owned, one-shot authorization for one immutable Document snapshot.
+/// All identity fields are supplied by the Broker when the grant is issued;
+/// the renderer's payload is only checked against this record, never trusted.
+pub struct SnapshotGrantRegistry {
+    registry_id: u64,
+    next_id: u64,
+    max_total_grants: usize,
+    max_per_renderer: usize,
+    grants: HashMap<SnapshotGrantId, SnapshotGrantRecord>,
+}
+
+impl SnapshotGrantRegistry {
+    pub fn new(
+        max_total_grants: usize,
+        max_per_renderer: usize,
+    ) -> Result<Self, SnapshotGrantError> {
+        if max_total_grants == 0 || max_per_renderer == 0 || max_per_renderer > max_total_grants {
+            return Err(SnapshotGrantError::InvalidQuota);
+        }
+        let registry_id = NEXT_REGISTRY_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| SnapshotGrantError::IdExhausted)?;
+        Ok(Self {
+            registry_id,
+            next_id: 1,
+            max_total_grants,
+            max_per_renderer,
+            grants: HashMap::new(),
+        })
+    }
+
+    pub fn issue(
+        &mut self,
+        renderer: RendererPrincipal,
+        origin: OriginGroupId,
+        document_id: u64,
+        revision: u64,
+    ) -> Result<SnapshotGrantId, SnapshotGrantError> {
+        if document_id == 0 || revision == 0 {
+            return Err(SnapshotGrantError::InvalidIdentity);
+        }
+        if self.grants.len() >= self.max_total_grants {
+            return Err(SnapshotGrantError::QuotaExceeded(QuotaScope::Global));
+        }
+        if self
+            .grants
+            .values()
+            .filter(|record| record.renderer == renderer)
+            .count()
+            >= self.max_per_renderer
+        {
+            return Err(SnapshotGrantError::QuotaExceeded(QuotaScope::PerRenderer));
+        }
+        let id = SnapshotGrantId {
+            registry_id: self.registry_id,
+            sequence: self.next_id,
+        };
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(SnapshotGrantError::IdExhausted)?;
+        self.grants.insert(
+            id,
+            SnapshotGrantRecord {
+                renderer,
+                origin,
+                document_id,
+                revision,
+                consumed: false,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn authorize(
+        &mut self,
+        id: SnapshotGrantId,
+        renderer: RendererPrincipal,
+        origin: OriginGroupId,
+        document_id: u64,
+        revision: u64,
+    ) -> Result<(), SnapshotGrantError> {
+        if id.registry_id != self.registry_id {
+            return Err(SnapshotGrantError::UnknownGrant);
+        }
+        let record = self
+            .grants
+            .get_mut(&id)
+            .ok_or(SnapshotGrantError::UnknownGrant)?;
+        if record.renderer != renderer {
+            return Err(SnapshotGrantError::WrongRenderer);
+        }
+        if record.origin != origin {
+            return Err(SnapshotGrantError::WrongOrigin);
+        }
+        if record.document_id != document_id {
+            return Err(SnapshotGrantError::WrongDocument);
+        }
+        if record.revision != revision {
+            return Err(SnapshotGrantError::StaleRevision);
+        }
+        if record.consumed {
+            return Err(SnapshotGrantError::Replay);
+        }
+        record.consumed = true;
+        Ok(())
+    }
+
+    pub fn revoke(
+        &mut self,
+        id: SnapshotGrantId,
+    ) -> Result<SnapshotGrantRevocation, SnapshotGrantError> {
+        if id.registry_id != self.registry_id {
+            return Err(SnapshotGrantError::UnknownGrant);
+        }
+        let record = self
+            .grants
+            .remove(&id)
+            .ok_or(SnapshotGrantError::UnknownGrant)?;
+        Ok(if record.consumed {
+            SnapshotGrantRevocation::AlreadyConsumed
+        } else {
+            SnapshotGrantRevocation::RevokedBeforeUse
+        })
+    }
+
+    pub fn release_renderer(&mut self, renderer: RendererPrincipal) -> usize {
+        let ids: Vec<_> = self
+            .grants
+            .iter()
+            .filter_map(|(id, record)| (record.renderer == renderer).then_some(*id))
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            self.grants.remove(&id);
+        }
+        count
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.grants.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -688,5 +886,114 @@ mod tests {
             RendererPrincipal::new(RendererId::new(1).unwrap(), 0, 1, 1),
             None
         );
+    }
+
+    #[test]
+    fn snapshot_grant_binds_renderer_origin_document_and_revision_once() {
+        use super::{SnapshotGrantError, SnapshotGrantRegistry};
+        let owner = renderer(91, 8191);
+        let origin_id = origin(77);
+        let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
+        let grant = grants.issue(owner, origin_id, 7001, 4).unwrap();
+        grants.authorize(grant, owner, origin_id, 7001, 4).unwrap();
+        assert_eq!(
+            grants.authorize(grant, owner, origin_id, 7001, 4),
+            Err(SnapshotGrantError::Replay)
+        );
+        assert_eq!(
+            grants.revoke(grant),
+            Ok(super::SnapshotGrantRevocation::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn snapshot_grant_rejects_renderer_instance_origin_document_and_revision_mismatch() {
+        use super::{SnapshotGrantError, SnapshotGrantRegistry};
+        let owner = renderer(91, 8191);
+        let replacement_instance = renderer(92, 8191);
+        let origin_id = origin(77);
+        let mut grants = SnapshotGrantRegistry::new(8, 2).unwrap();
+        let grant = grants.issue(owner, origin_id, 7001, 4).unwrap();
+        assert_eq!(
+            grants.authorize(grant, replacement_instance, origin_id, 7001, 4),
+            Err(SnapshotGrantError::WrongRenderer)
+        );
+        assert_eq!(
+            grants.authorize(grant, owner, origin(78), 7001, 4),
+            Err(SnapshotGrantError::WrongOrigin)
+        );
+        assert_eq!(
+            grants.authorize(grant, owner, origin_id, 7002, 4),
+            Err(SnapshotGrantError::WrongDocument)
+        );
+        assert_eq!(
+            grants.authorize(grant, owner, origin_id, 7001, 5),
+            Err(SnapshotGrantError::StaleRevision)
+        );
+        grants.authorize(grant, owner, origin_id, 7001, 4).unwrap();
+    }
+
+    #[test]
+    fn snapshot_grant_enforces_quotas_and_renderer_release() {
+        use super::{SnapshotGrantError, SnapshotGrantRegistry};
+        let first = renderer(91, 8191);
+        let second = renderer(92, 8192);
+        let mut grants = SnapshotGrantRegistry::new(2, 1).unwrap();
+        let first_grant = grants.issue(first, origin(77), 7001, 1).unwrap();
+        assert_eq!(
+            grants.issue(first, origin(77), 7002, 1),
+            Err(SnapshotGrantError::QuotaExceeded(
+                super::QuotaScope::PerRenderer
+            ))
+        );
+        grants.issue(second, origin(78), 7003, 1).unwrap();
+        assert_eq!(
+            grants.issue(renderer(93, 8193), origin(79), 7004, 1),
+            Err(SnapshotGrantError::QuotaExceeded(super::QuotaScope::Global))
+        );
+        assert_eq!(grants.release_renderer(first), 1);
+        assert_eq!(grants.active_count(), 1);
+        grants
+            .authorize(first_grant, first, origin(77), 7001, 1)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn snapshot_grant_rejects_zero_document_or_revision() {
+        use super::{SnapshotGrantError, SnapshotGrantRegistry};
+        let mut grants = SnapshotGrantRegistry::new(2, 1).unwrap();
+        let owner = renderer(91, 8191);
+        assert_eq!(
+            grants.issue(owner, origin(77), 0, 1),
+            Err(SnapshotGrantError::InvalidIdentity)
+        );
+        assert_eq!(
+            grants.issue(owner, origin(77), 1, 0),
+            Err(SnapshotGrantError::InvalidIdentity)
+        );
+    }
+
+    #[test]
+    fn snapshot_grant_can_be_revoked_and_renderer_cleanup_releases_remaining_grants() {
+        use super::{SnapshotGrantError, SnapshotGrantRegistry};
+        let owner = renderer(91, 8191);
+        let origin_id = origin(77);
+        let mut grants = SnapshotGrantRegistry::new(4, 4).unwrap();
+        let revoked = grants.issue(owner, origin_id, 7001, 1).unwrap();
+        let remaining = grants.issue(owner, origin_id, 7002, 1).unwrap();
+        assert_eq!(
+            grants.revoke(revoked),
+            Ok(super::SnapshotGrantRevocation::RevokedBeforeUse)
+        );
+        assert_eq!(
+            grants.authorize(revoked, owner, origin_id, 7001, 1),
+            Err(SnapshotGrantError::UnknownGrant)
+        );
+        assert_eq!(grants.release_renderer(owner), 1);
+        assert_eq!(
+            grants.authorize(remaining, owner, origin_id, 7002, 1),
+            Err(SnapshotGrantError::UnknownGrant)
+        );
+        assert_eq!(grants.active_count(), 0);
     }
 }
