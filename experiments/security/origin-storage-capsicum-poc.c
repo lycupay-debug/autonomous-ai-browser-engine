@@ -388,11 +388,32 @@ static int renderer_read_origin_a(int inherited_ipc_fd, int inherited_origin_a_f
         perror("renderer ready IPC");
         return EXIT_FAILURE;
     }
+
+    /* Prove the delegated FD remains usable after the broker closes its copy. */
+    char command[4] = {0};
+    if (read(RENDERER_IPC_FD, command, sizeof(command)) != (ssize_t)sizeof(command) ||
+        memcmp(command, "read", sizeof(command)) != 0) {
+        (void)fprintf(stderr, "FAIL: renderer did not receive broker read probe\n");
+        return EXIT_FAILURE;
+    }
+    own_file = openat(storage_fd, "secret.txt", O_RDONLY);
+    if (own_file < 0) {
+        perror("renderer read after broker descriptor close");
+        return EXIT_FAILURE;
+    }
+    memset(value, 0, sizeof(value));
+    count = read(own_file, value, sizeof(value) - 1);
+    (void)close(own_file);
+    if (count != 8 || strcmp(value, "origin-A") != 0 ||
+        write(RENDERER_IPC_FD, "read-ok", 7) != 7) {
+        (void)fprintf(stderr, "FAIL: delegated storage FD did not remain usable\n");
+        return EXIT_FAILURE;
+    }
     (void)puts("PASS: versioned grant bound to renderer PID and Origin A; cross-origin traversal and writes denied");
     (void)fflush(stdout);
-    (void)close(storage_fd);
-    (void)close(RENDERER_IPC_FD);
-    return EXIT_SUCCESS;
+
+    /* Capsicum rights are monotonic, but a transferred FD is not remotely revocable. */
+    for (;;) (void)pause();
 }
 
 int main(void)
@@ -482,18 +503,35 @@ int main(void)
         goto cleanup;
     }
 
+    if (write(channels[0], "read", 4) != 4) {
+        perror("broker request post-transfer storage read");
+        goto cleanup;
+    }
+    char storage_response[7] = {0};
+    if (read(channels[0], storage_response, sizeof(storage_response)) !=
+            (ssize_t)sizeof(storage_response) ||
+        memcmp(storage_response, "read-ok", sizeof(storage_response)) != 0) {
+        (void)fprintf(stderr, "FAIL: renderer could not use delegated FD after broker closed its copy\n");
+        goto cleanup;
+    }
+
+    if (kill(child, SIGKILL) != 0) {
+        perror("broker terminate renderer to revoke delegated capability");
+        goto cleanup;
+    }
     if (waitpid(child, &status, 0) < 0) {
-        perror("waitpid renderer");
+        perror("waitpid revoked renderer");
         child = -1;
         goto cleanup;
     }
     child = -1;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
-        (void)fprintf(stderr, "FAIL: Origin A renderer isolation test failed\n");
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+        (void)fprintf(stderr, "FAIL: broker did not terminate renderer holding delegated storage FD\n");
         goto cleanup;
     }
 
     (void)puts("PASS: broker authenticated peer UID/GID and transferred one PID/Origin-scoped storage capability");
+    (void)puts("PASS: broker-local FD close does not revoke renderer copy; terminating renderer revokes process-held capability");
     result = EXIT_SUCCESS;
 
 cleanup:

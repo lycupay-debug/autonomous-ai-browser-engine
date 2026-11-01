@@ -382,7 +382,7 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 ### Verification
 
 - FreeBSD 15.1: `clang -Wall -Wextra -Werror -O2` compile passed.
-- Grant-envelope and per-Origin storage PoC: all five positive/negative checks passed.
+- Grant-envelope and per-Origin storage PoC: all six positive/negative checks passed, including wrong-Origin and wrong-PID rejection, continued renderer access after the Broker closes its local FD copy, and Broker `SIGKILL` termination of the renderer.
 - The complete focused PoC passed 20/20 independent executions.
 - `clang --analyze -Wall -Wextra -O2` passed; generated plist was removed.
 - `git diff --check` passed.
