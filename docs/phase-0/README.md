@@ -588,3 +588,11 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Added a UnixStream socket-pair round-trip and negative tests. UDS crate: 27/27 tests passed; workspace: 166/166 passed; Rustfmt, Clippy (`-D warnings`), diff check and full Security PoC suite passed.
 - The codec is deliberately not wired into the existing authenticated server path. It does not authenticate peers, authorize Document/Origin/Renderer grants, or transfer SCM_RIGHTS descriptors. Callers must enforce FreeBSD getpeereid identity, Renderer instance and Origin grant before accepting the payload; callers must also set finite socket read/write timeouts.
 - This is a bounded framing and schema-validation PoC, not cross-process Broker/Renderer integration or production IPC. No service or persistent host configuration was changed.
+
+## 2026-11-01 authenticated cross-process UDS Snapshot round-trip
+
+- Added a dedicated test sender binary and FreeBSD integration test. The parent creates a private 0600 UDS endpoint; an independent child process connects and writes a V1 DOM Snapshot frame; the parent accepts the socket, verifies kernel peer UID/GID with `getpeereid()` against its expected identity, then decodes and validates the frame.
+- The integration test uses a finite accept deadline and socket read/write timeouts. It verifies request ID 99, Document ID 7, revision 3 and the payload graph received from the child process.
+- This closes the gap between the earlier same-process UnixStream-pair codec test and a real process boundary. It is still a test-only endpoint; the production/test Broker request handler is not yet wired to the new Snapshot frame codec, and no Renderer/Origin grant is currently checked by this path.
+- FreeBSD UDS crate: 28 tests passed (27 unit + 1 independent-process integration); full workspace: 167/167 passed; Rustfmt, Workspace Clippy (`-D warnings`), diff check and Security PoC suite passed.
+- GitHub-hosted Linux CI compiles the helper but the FreeBSD-only getpeereid integration test is cfg-disabled there; this integration result was observed on the FreeBSD host.
