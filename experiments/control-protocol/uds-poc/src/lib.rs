@@ -2,8 +2,9 @@
 //!
 //! This is a local protocol/state-machine PoC, not a production broker. It has
 //! a FreeBSD kernel-authenticated UDS accept helper used by the test server,
-//! but does not yet execute browser tasks or enforce the complete capability
-//! and policy model.
+//! and a separate bounded binary DOM Snapshot frame codec. The Snapshot codec
+//! is not wired into the authenticated server path and does not itself authorize
+//! peers, Documents, Origins, or SCM_RIGHTS grants. This is not a production broker.
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -17,6 +18,8 @@ use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+pub mod snapshot_frame;
 
 use serde_json::Value;
 #[cfg(test)]
