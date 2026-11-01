@@ -632,11 +632,23 @@ mod tests {
 
         let payload = "x".repeat(70 * 1024);
         let mut client = UnixStream::connect(&path).expect("connect raw oversized client");
-        writeln!(
-            client,
-            "{{\"protocol_version\":1,\"request_id\":\"oversized-1\",\"method\":\"health.get\",\"params\":{{\"payload\":\"{payload}\"}}}}"
-        )
-        .expect("send oversized raw request");
+        let request = format!(
+            "{{\"protocol_version\":1,\"request_id\":\"oversized-1\",\"method\":\"health.get\",\"params\":{{\"payload\":\"{payload}\"}}}}\n"
+        );
+        for chunk in request.as_bytes().chunks(1024) {
+            match client.write_all(chunk) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("send oversized raw request: {error}"),
+            }
+        }
         let mut response_line = String::new();
         BufReader::new(client)
             .read_line(&mut response_line)

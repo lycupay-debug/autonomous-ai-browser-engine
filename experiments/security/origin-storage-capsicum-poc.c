@@ -49,6 +49,22 @@ static int limit_standard_descriptors(void)
     return 0;
 }
 
+static int authorize_renderer_peer(int ipc_fd)
+{
+    uid_t peer_uid = (uid_t)-1;
+    gid_t peer_gid = (gid_t)-1;
+    if (getpeereid(ipc_fd, &peer_uid, &peer_gid) != 0) {
+        perror("getpeereid renderer IPC peer");
+        return -1;
+    }
+    if (peer_uid != geteuid() || peer_gid != getegid()) {
+        (void)fprintf(stderr, "FAIL: renderer peer UID/GID does not match broker policy\n");
+        errno = EPERM;
+        return -1;
+    }
+    return 0;
+}
+
 static int send_origin_storage_fd(int ipc_fd, int storage_fd)
 {
     char marker = 'A';
@@ -338,6 +354,10 @@ int main(void)
 
     (void)close(channels[1]);
     channels[1] = -1;
+    if (authorize_renderer_peer(channels[0]) != 0) {
+        perror("authorize renderer peer before storage grant");
+        goto cleanup;
+    }
     if (send_origin_storage_fd(channels[0], origin_a_fd) != 0) {
         perror("broker send Origin A storage FD");
         goto cleanup;
