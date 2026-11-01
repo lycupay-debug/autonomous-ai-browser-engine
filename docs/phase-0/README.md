@@ -332,13 +332,13 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - Client validates that the broker response is a JSON object and rejects oversized or truncated responses.
 - Requests must be JSON objects. Request IDs, method names, and task IDs have explicit 256-byte limits; invalid request IDs are not echoed into error responses.
 - Server response write errors are propagated instead of panicking if the client disconnects.
-- Existing FreeBSD getpeereid authorized-accept path remains in place for the test server.
+- FreeBSD test-server accept now checks both kernel-reported effective UID and GID through getpeereid; a mismatched GID is rejected even when UID matches.
 
 ### Verification
-- UDS protocol tests: 16/16 passed on FreeBSD 15.1-RELEASE-p6.
+- UDS protocol tests: 17/17 passed on FreeBSD 15.1-RELEASE-p6.
 - New negative tests cover exact frame-size boundary, one-byte-over limit, oversized outbound request before connect, oversized inbound broker response, truncated response, invalid top-level JSON shape, oversized request ID, and client disconnect during response write.
 - UDS crate Clippy with -D warnings: passed.
-- Full FreeBSD workspace: 87/87 tests passed (Boa 7, Browser Runtime 7, UDS 16, Headless 4, V8 FFI 21, Network 17, Origin Policy 15).
+- Full FreeBSD workspace: 88/88 tests passed (Boa 7, Browser Runtime 7, UDS 17, Headless 4, V8 FFI 21, Network 17, Origin Policy 15).
 - cargo fmt --all -- --check, workspace Clippy with -D warnings, and git diff --check: passed.
 
 ### Limits

@@ -35,6 +35,30 @@ pub struct PeerCredentials {
     pub gid: u32,
 }
 
+/// Trusted local-peer identity policy. GID matching is optional for callers
+/// that intentionally authorize an entire UID regardless of its primary GID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerAuthorizationPolicy {
+    expected_uid: u32,
+    expected_gid: Option<u32>,
+}
+
+impl PeerAuthorizationPolicy {
+    pub const fn uid_only(expected_uid: u32) -> Self {
+        Self {
+            expected_uid,
+            expected_gid: None,
+        }
+    }
+
+    pub const fn exact_uid_gid(expected_uid: u32, expected_gid: u32) -> Self {
+        Self {
+            expected_uid,
+            expected_gid: Some(expected_gid),
+        }
+    }
+}
+
 /// Read kernel-authenticated Unix-socket peer credentials on FreeBSD.
 /// Other platforms return Unsupported rather than silently trusting a peer.
 #[cfg(target_os = "freebsd")]
@@ -64,33 +88,73 @@ pub fn peer_credentials(_stream: &UnixStream) -> std::io::Result<PeerCredentials
 }
 
 /// Authorize a UDS connection only when the kernel-reported peer UID matches.
-pub fn authorize_peer_uid(
+/// Authorize a UDS connection against kernel-reported UID and optional GID.
+pub fn authorize_peer(
     stream: &UnixStream,
-    expected_uid: u32,
+    policy: PeerAuthorizationPolicy,
 ) -> std::io::Result<PeerCredentials> {
     let credentials = peer_credentials(stream)?;
-    if credentials.uid != expected_uid {
+    if credentials.uid != policy.expected_uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "UDS peer UID {} does not match expected UID {expected_uid}",
-                credentials.uid
+                "UDS peer UID {} does not match expected UID {}",
+                credentials.uid, policy.expected_uid
+            ),
+        ));
+    }
+    if let Some(expected_gid) = policy.expected_gid
+        && credentials.gid != expected_gid
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "UDS peer GID {} does not match expected GID {expected_gid}",
+                credentials.gid
             ),
         ));
     }
     Ok(credentials)
 }
 
-/// Accept one UDS client only when FreeBSD reports the expected peer UID.
-/// The returned credentials are kernel supplied, not fields from the request.
+/// Compatibility helper for policies that authorize every process of one UID.
+pub fn authorize_peer_uid(
+    stream: &UnixStream,
+    expected_uid: u32,
+) -> std::io::Result<PeerCredentials> {
+    authorize_peer(stream, PeerAuthorizationPolicy::uid_only(expected_uid))
+}
+
+/// Authorize both the kernel-reported effective UID and effective GID.
+pub fn authorize_peer_uid_gid(
+    stream: &UnixStream,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> std::io::Result<PeerCredentials> {
+    authorize_peer(
+        stream,
+        PeerAuthorizationPolicy::exact_uid_gid(expected_uid, expected_gid),
+    )
+}
+
+/// Accept a UDS client only when FreeBSD reports the expected peer identity.
+pub fn accept_authorized_peer_with_policy(
+    listener: &UnixListener,
+    policy: PeerAuthorizationPolicy,
+) -> std::io::Result<(UnixStream, PeerCredentials)> {
+    let (stream, _) = listener.accept()?;
+    let credentials = authorize_peer(&stream, policy)?;
+    Ok((stream, credentials))
+}
+
+/// Accept a UDS client only when FreeBSD reports the expected peer UID.
 pub fn accept_authorized_peer(
     listener: &UnixListener,
     expected_uid: u32,
 ) -> std::io::Result<(UnixStream, PeerCredentials)> {
-    let (stream, _) = listener.accept()?;
-    let credentials = authorize_peer_uid(&stream, expected_uid)?;
-    Ok((stream, credentials))
+    accept_authorized_peer_with_policy(listener, PeerAuthorizationPolicy::uid_only(expected_uid))
 }
+
 #[cfg(test)]
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -300,9 +364,14 @@ fn serve_connections(listener: UnixListener, connection_count: usize) {
             use std::ffi::c_uint;
             unsafe extern "C" {
                 fn geteuid() -> c_uint;
+                fn getegid() -> c_uint;
             }
             let expected_uid = unsafe { geteuid() };
-            match accept_authorized_peer(&listener, expected_uid) {
+            let expected_gid = unsafe { getegid() };
+            match accept_authorized_peer_with_policy(
+                &listener,
+                PeerAuthorizationPolicy::exact_uid_gid(expected_uid, expected_gid),
+            ) {
                 Ok((stream, _credentials)) => stream,
                 Err(_) => continue,
             }
@@ -609,8 +678,41 @@ mod tests {
 
     #[cfg(target_os = "freebsd")]
     #[test]
+    fn authenticated_accept_rejects_a_peer_with_the_wrong_gid() {
+        use super::{PeerAuthorizationPolicy, accept_authorized_peer_with_policy};
+        use std::ffi::c_uint;
+        use std::os::unix::net::UnixStream;
+
+        unsafe extern "C" {
+            fn geteuid() -> c_uint;
+            fn getegid() -> c_uint;
+        }
+
+        let path = socket_path("wrong-gid");
+        let listener = bind_private_socket(&path).expect("bind private UDS");
+        let expected_uid = unsafe { geteuid() };
+        let expected_gid = unsafe { getegid() }.wrapping_add(1);
+        let server = thread::spawn(move || {
+            accept_authorized_peer_with_policy(
+                &listener,
+                PeerAuthorizationPolicy::exact_uid_gid(expected_uid, expected_gid),
+            )
+            .expect_err("peer with a different GID must be rejected")
+            .kind()
+        });
+        let client = UnixStream::connect(&path).expect("connect local peer");
+        assert_eq!(
+            server.join().expect("server exits"),
+            std::io::ErrorKind::PermissionDenied
+        );
+        drop(client);
+        fs::remove_file(path).expect("remove socket");
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
     fn kernel_peer_credentials_match_the_current_process() {
-        use super::{authorize_peer_uid, peer_credentials};
+        use super::{authorize_peer_uid, authorize_peer_uid_gid, peer_credentials};
         use std::ffi::c_uint;
         use std::os::unix::net::UnixStream;
 
@@ -624,6 +726,13 @@ mod tests {
         assert_eq!(credentials.uid, unsafe { geteuid() });
         assert_eq!(credentials.gid, unsafe { getegid() });
         assert!(authorize_peer_uid(&server, credentials.uid).is_ok());
+        assert!(authorize_peer_uid_gid(&server, credentials.uid, credentials.gid).is_ok());
+        assert_eq!(
+            authorize_peer_uid_gid(&server, credentials.uid, credentials.gid.wrapping_add(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
         assert_eq!(
             authorize_peer_uid(&server, credentials.uid.wrapping_add(1))
                 .unwrap_err()
