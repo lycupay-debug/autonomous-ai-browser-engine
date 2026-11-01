@@ -1,5 +1,5 @@
 #!/bin/sh
-# Generate pinned CycloneDX 1.5 SBOMs for each Cargo workspace crate.
+# Generate one CycloneDX 1.5 SBOM per member of the Cargo workspace.
 set -eu
 REPO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CARGO_CYCLONEDX=${CARGO_CYCLONEDX:-cargo-cyclonedx}
@@ -8,18 +8,18 @@ command -v "$CARGO_CYCLONEDX" >/dev/null 2>&1 || {
   exit 127
 }
 mkdir -p "$REPO_DIR/sbom"
+"$CARGO_CYCLONEDX" cyclonedx \
+  --manifest-path "$REPO_DIR/Cargo.toml" \
+  --format json --spec-version 1.5 --all
+
 for entry in \
-  "experiments/js-runtime/boa-host:boa-host" \
-  "experiments/js-runtime/ffi-poc:js-runtime-ffi" \
-  "experiments/headless/raster-poc:headless-raster" \
-  "experiments/network-policy:network-policy" \
-  "experiments/control-protocol/uds-poc:control-protocol-uds"
+  "experiments/js-runtime/boa-host/aibe-boa-host-poc.cdx.json:aibe-boa-host.cdx.json" \
+  "experiments/js-runtime/ffi-poc/aibe-js-runtime-ffi-poc.cdx.json:aibe-js-runtime-ffi.cdx.json" \
+  "experiments/headless/raster-poc/aibe-headless-raster-poc.cdx.json:aibe-headless-raster.cdx.json" \
+  "experiments/network-policy/aibe-network-policy-poc.cdx.json:aibe-network-policy.cdx.json" \
+  "experiments/control-protocol/uds-poc/aibe-control-protocol-uds-poc.cdx.json:aibe-control-protocol-uds.cdx.json"
 do
-  manifest=${entry%%:*}/Cargo.toml
-  name=${entry##*:}
-  "$CARGO_CYCLONEDX" cyclonedx \
-    --manifest-path "$REPO_DIR/$manifest" \
-    --format json --spec-version 1.5 --all \
-    --override-filename "aibe-$name"
-  mv "$REPO_DIR/${entry%%:*}/aibe-$name.json" "$REPO_DIR/sbom/aibe-$name.cdx.json"
+  source=${entry%%:*}
+  destination=${entry##*:}
+  mv "$REPO_DIR/$source" "$REPO_DIR/sbom/$destination"
 done
