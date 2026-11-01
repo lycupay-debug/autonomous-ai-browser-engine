@@ -666,6 +666,34 @@ mod tests {
     }
 
     #[test]
+    fn frame_detach_processes_siblings_in_stable_id_order_on_failure() {
+        use super::navigation::{NavigationController, NavigationMode};
+        let runtime = MockRuntime {
+            // Root Realm is 1 and the first-created child Realm is 2.
+            fail_destroy_realm_once: Some(2),
+            ..MockRuntime::default()
+        };
+        let mut controller = NavigationController::new(runtime).unwrap();
+        let root = controller.create_root_frame("https://a.example/").unwrap();
+        let first_child = controller
+            .create_child_frame(root, "https://b.example/", NavigationMode::Url)
+            .unwrap();
+        let second_child = controller
+            .create_child_frame(root, "https://c.example/", NavigationMode::Url)
+            .unwrap();
+
+        assert!(controller.detach_frame(root).is_err());
+        assert_eq!(controller.frame_parent(first_child), Some(root));
+        assert_eq!(controller.frame_parent(second_child), Some(root));
+        assert_eq!(controller.active_frame_count(), 3);
+
+        assert_eq!(controller.detach_frame(root).unwrap(), 3);
+        assert_eq!(controller.active_frame_count(), 0);
+        assert_eq!(controller.active_document_count(), 0);
+        assert_eq!(controller.coordinator().active_origin_group_count(), 0);
+    }
+
+    #[test]
     fn dedicated_worker_uses_a_separate_realm_in_the_document_origin_group() {
         use super::navigation::{NavigationController, WorkerState};
         let mut controller = NavigationController::new(MockRuntime::default()).unwrap();

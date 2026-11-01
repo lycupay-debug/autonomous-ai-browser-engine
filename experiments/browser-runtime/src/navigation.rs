@@ -539,7 +539,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
     /// Detaches a Frame subtree in post-order. If Runtime destruction fails,
     /// already-detached descendants stay detached and the remaining tree can be retried.
     pub fn detach_frame(&mut self, frame: FrameId) -> Result<usize, NavigationError<R::Error>> {
-        let children = self
+        let mut children = self
             .frames
             .get(&frame)
             .ok_or(NavigationError::UnknownFrame)?
@@ -547,6 +547,7 @@ impl<R: OriginRealmRuntime> NavigationController<R> {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.0);
         let mut detached = 0;
         for child in children {
             detached += self.detach_frame(child)?;
