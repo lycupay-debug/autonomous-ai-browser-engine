@@ -82,7 +82,7 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - V8 process-wide platform initialization now runs once. Multiple isolate/context instances have independent global state and lifetimes. The Rust wrapper is thread-affine (`!Send + !Sync`) and the C ABI rejects wrong-thread operations.
 - V8 microtasks use an explicit host checkpoint; this is not the WHATWG HTML Event Loop.
 - A minimal project-owned `JsRuntime` trait now hides the concrete V8 runtime and exposes stringified evaluation, microtask checkpoints, and GC; trait-object dispatch is tested. This is not the final production contract because typed values, context/realm handles, callbacks, host objects, and scheduler integration are still missing.
-- A V8 native `Node` wrapper PoC now validates append/childCount, moving a child between parents, rejecting ancestor cycles (preventing native shared-pointer graph leaks), JS self-reference, native parent/child ownership, and GC weak finalization. Wrapper identity/cache, listeners, navigation teardown and Worker lifetimes remain open.
+- A V8 native `Node` wrapper PoC now validates append/childCount/firstChild, moving a child between parents, rejecting ancestor cycles, JS self-reference, native parent/child ownership, and GC weak finalization. A weak per-runtime wrapper identity cache preserves `===` identity and allows a native child to be re-wrapped after its previous JS wrapper is collected. Cross-Realm caching, event-listener closures, navigation teardown and Worker lifetimes remain open.
 
 ## Network pinned TLS and redirect evidence — 2026-11-01
 
@@ -146,4 +146,12 @@ See the parent architecture blueprint's Phase 0 exit criteria. Do not proceed to
 - V8 implements `evaluate_to_string`, `microtask_checkpoint`, and `collect_garbage` without exposing V8 C++ or V8 Rust types.
 - A trait-object dispatch test confirms the selected runtime is usable through the project-owned interface.
 - This is a Phase 0 contract proof, not a production API freeze. Typed JS values, explicit context/realm handles, native callbacks, host objects, structured errors, and browser scheduler integration remain required.
-- V8 FFI test count is now 9/9; total FreeBSD workspace tests are 45/45.
+- V8 FFI test count at this historical snapshot was 9/9; total FreeBSD workspace tests were 45/45.
+
+## DOM wrapper identity cache update — 2026-11-01
+
+- Added a weak per-runtime wrapper identity map keyed by native Node address. Weak V8 Global handles ensure the cache does not keep JavaScript wrapper objects alive; the weak finalizer removes entries when wrappers are collected.
+- Added `Node.firstChild()`. It returns the existing JS wrapper when one is alive, preserving `===` identity across repeated reads; when the old wrapper has been collected but the native parent still owns the child node, it creates a replacement wrapper for the same native node.
+- Added tests for stable wrapper identity, `null` on an empty parent, GC of an unreachable child wrapper, and re-wrapping the still-attached native child.
+- FreeBSD V8 FFI tests: 10/10 passed. Full workspace tests: 47/47 passed (Boa 7, UDS 9, Headless 4, V8 FFI 10, Network 17). Formatting and Clippy with `-D warnings` passed.
+- Scope remains intentionally narrow: one Runtime/Context per cache. Cross-Realm/Agent wrapper semantics, listener-held JS closures, MutationObserver, navigation/Frame/Worker teardown, GC stress and resource quotas remain open.

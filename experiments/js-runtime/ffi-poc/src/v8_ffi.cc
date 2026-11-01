@@ -7,7 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <libplatform/libplatform.h>
@@ -53,7 +53,9 @@ struct AibeV8Runtime {
     v8::Isolate* isolate = nullptr;
     v8::Global<v8::Context> context;
     std::thread::id owner_thread;
-    std::unordered_set<AibeNodeWrapper*> node_wrappers;
+    v8::Global<v8::FunctionTemplate> node_template;
+    // Weak per-runtime identity cache: it must not keep JS wrappers alive.
+    std::unordered_map<AibeNativeNode*, AibeNodeWrapper*> node_wrappers;
 };
 
 namespace {
@@ -76,9 +78,56 @@ void node_wrapper_weak_callback(const v8::WeakCallbackInfo<AibeNodeWrapper>& inf
 {
     auto* wrapper = info.GetParameter();
     wrapper->object.Reset();
-    wrapper->owner->node_wrappers.erase(wrapper);
+    wrapper->owner->node_wrappers.erase(wrapper->node.get());
     g_finalized_dom_wrappers.fetch_add(1, std::memory_order_relaxed);
     delete wrapper;
+}
+
+// Attach one JS object to a native Node and register its weak identity entry.
+// The weak callback removes the cache entry when JS no longer retains the object.
+AibeNodeWrapper* attach_node_wrapper(
+    AibeV8Runtime* runtime,
+    v8::Local<v8::Object> object,
+    const std::shared_ptr<AibeNativeNode>& node)
+{
+    auto* isolate = runtime->isolate;
+    auto* wrapper = new AibeNodeWrapper{runtime, node, {}};
+    object->SetInternalField(
+        0, v8::External::New(isolate, wrapper, v8::kExternalPointerTypeTagDefault));
+    wrapper->object.Reset(isolate, object);
+    wrapper->object.SetWeak(wrapper, node_wrapper_weak_callback, v8::WeakCallbackType::kParameter);
+    runtime->node_wrappers.emplace(wrapper->node.get(), wrapper);
+    return wrapper;
+}
+
+// Return the existing wrapper for this native identity, or create a new one.
+// Native ownership may outlive a JS wrapper, so re-wrapping is an expected path.
+v8::MaybeLocal<v8::Object> wrap_node(
+    AibeV8Runtime* runtime,
+    const std::shared_ptr<AibeNativeNode>& node)
+{
+    auto* isolate = runtime->isolate;
+    auto found = runtime->node_wrappers.find(node.get());
+    if (found != runtime->node_wrappers.end()) {
+        auto object = found->second->object.Get(isolate);
+        if (!object.IsEmpty()) {
+            return object;
+        }
+        return {};
+    }
+
+    auto node_template = runtime->node_template.Get(isolate);
+    if (node_template.IsEmpty()) {
+        return {};
+    }
+    v8::Local<v8::Object> object;
+    if (!node_template->InstanceTemplate()
+             ->NewInstance(isolate->GetCurrentContext())
+             .ToLocal(&object)) {
+        return {};
+    }
+    attach_node_wrapper(runtime, object, node);
+    return object;
 }
 
 void node_constructor(const v8::FunctionCallbackInfo<v8::Value>& info)
@@ -91,11 +140,7 @@ void node_constructor(const v8::FunctionCallbackInfo<v8::Value>& info)
         return;
     }
 
-    auto* wrapper = new AibeNodeWrapper{runtime, std::make_shared<AibeNativeNode>(), {}};
-    wrapper->object.Reset(isolate, info.This());
-    wrapper->object.SetWeak(wrapper, node_wrapper_weak_callback, v8::WeakCallbackType::kParameter);
-    runtime->node_wrappers.insert(wrapper);
-    info.This()->SetInternalField(0, v8::External::New(isolate, wrapper, v8::kExternalPointerTypeTagDefault));
+    attach_node_wrapper(runtime, info.This(), std::make_shared<AibeNativeNode>());
     info.GetReturnValue().Set(info.This());
 }
 
@@ -151,10 +196,35 @@ void node_child_count(const v8::FunctionCallbackInfo<v8::Value>& info)
         isolate, static_cast<int>(wrapper->node->children.size())));
 }
 
+// Child access must pass through wrap_node so repeated reads preserve === identity.
+void node_first_child(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    auto* isolate = info.GetIsolate();
+    auto* parent = node_wrapper_from(info.This());
+    if (parent == nullptr) {
+        isolate->ThrowException(v8::Exception::TypeError(
+            v8::String::NewFromUtf8Literal(isolate, "firstChild receiver is not a Node")));
+        return;
+    }
+    if (parent->node->children.empty()) {
+        info.GetReturnValue().Set(v8::Null(isolate));
+        return;
+    }
+
+    v8::Local<v8::Object> child;
+    if (!wrap_node(parent->owner, parent->node->children.front()).ToLocal(&child)) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(isolate, "unable to create Node wrapper")));
+        return;
+    }
+    info.GetReturnValue().Set(child);
+}
+
 bool install_node_class(AibeV8Runtime* runtime, v8::Local<v8::Context> context)
 {
     auto* isolate = runtime->isolate;
     auto node_template = v8::FunctionTemplate::New(isolate, node_constructor);
+    runtime->node_template.Reset(isolate, node_template);
     node_template->SetClassName(v8::String::NewFromUtf8Literal(isolate, "Node"));
     node_template->InstanceTemplate()->SetInternalFieldCount(1);
     node_template->PrototypeTemplate()->Set(
@@ -165,6 +235,10 @@ bool install_node_class(AibeV8Runtime* runtime, v8::Local<v8::Context> context)
         isolate,
         "childCount",
         v8::FunctionTemplate::New(isolate, node_child_count));
+    node_template->PrototypeTemplate()->Set(
+        isolate,
+        "firstChild",
+        v8::FunctionTemplate::New(isolate, node_first_child));
     v8::Local<v8::Function> constructor;
     if (!node_template->GetFunction(context).ToLocal(&constructor)) {
         return false;
@@ -316,7 +390,9 @@ extern "C" int aibe_v8_destroy(void* opaque)
         return -7;
     }
     runtime->context.Reset();
-    for (auto* wrapper : runtime->node_wrappers) {
+    runtime->node_template.Reset();
+    for (const auto& entry : runtime->node_wrappers) {
+        auto* wrapper = entry.second;
         wrapper->object.Reset();
         delete wrapper;
     }

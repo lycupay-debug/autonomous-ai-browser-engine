@@ -273,6 +273,48 @@ mod tests {
     }
 
     #[test]
+    fn v8_dom_wrapper_cache_preserves_identity_and_rewraps_native_nodes() {
+        let before = V8Runtime::finalized_dom_wrapper_count();
+        let mut runtime = V8Runtime::new().expect("V8 runtime initializes");
+
+        assert_eq!(
+            runtime
+                .eval("(() => { const parent = new Node(); const child = new Node(); parent.appendChild(child); return parent.firstChild() === child && parent.firstChild() === parent.firstChild(); })()")
+                .expect("cached wrapper preserves object identity"),
+            "true"
+        );
+        assert_eq!(
+            runtime
+                .eval("new Node().firstChild() === null")
+                .expect("empty parent has no first child"),
+            "true"
+        );
+
+        runtime
+            .eval("globalThis.rootNode = new Node(); (() => { const transientChild = new Node(); rootNode.appendChild(transientChild); })();")
+            .expect("native parent retains child after JS wrapper becomes unreachable");
+        runtime
+            .collect_garbage()
+            .expect("V8 collects unreachable child wrapper");
+        assert!(
+            V8Runtime::finalized_dom_wrapper_count() > before,
+            "unreachable child wrapper should be finalized while native child remains attached"
+        );
+        assert_eq!(
+            runtime
+                .eval("rootNode.firstChild() === rootNode.firstChild()")
+                .expect("native child can be wrapped again"),
+            "true"
+        );
+        assert_eq!(
+            runtime
+                .eval("rootNode.firstChild().childCount()")
+                .expect("recreated wrapper references the same native node"),
+            "0"
+        );
+    }
+
+    #[test]
     fn v8_string_ffi_preserves_embedded_nul_bytes() {
         let mut v8 = V8Runtime::new().expect("V8 runtime initializes");
         assert_eq!(

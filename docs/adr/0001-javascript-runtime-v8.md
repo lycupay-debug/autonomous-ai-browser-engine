@@ -46,7 +46,7 @@ The project owner explicitly selected V8 on 2026-11-01 after reviewing the Phase
 - The project accepts a C++ dependency and FFI maintenance boundary in exchange for the observed performance and ecosystem maturity.
 - The exact V8 package version, shared libraries, startup data, build defines, and package checksums must be recorded in the release manifest.
 - A minimal project-owned `JsRuntime` Rust trait now hides the concrete V8 type and exposes stringified evaluation, microtask checkpoints, and GC. It is only the Phase 0 boundary proof; extend it with typed values, explicit realm/context handles, callbacks, host objects, structured errors, and scheduler integration before treating it as the stable production contract.
-- Expand DOM Wrapper Cache and native object lifetime tests: wrapper identity, listeners retaining JS closures, detach/navigation teardown, Frame/Worker shutdown, isolate disposal, GC pressure, and repeated context creation/destruction.
+- Extend the now-tested weak per-runtime DOM Wrapper Cache to explicit Realm/Context boundaries only after the agent model is specified. Continue native object lifetime tests for listeners retaining JS closures, detach/navigation teardown, Frame/Worker shutdown, isolate disposal, GC pressure, and repeated context creation/destruction.
 - Define the browser's agent/isolate/context mapping before production process topology is frozen. The current one-isolate/one-context PoC is not the final realm model.
 - Add memory/CPU quotas, interrupt/deadline handling, stack limits, termination behavior, and crash recovery tests.
 - Keep SpiderMonkey's comparison scripts available so a V8 upgrade regression or FreeBSD package breakage can be evaluated against a known alternative.
