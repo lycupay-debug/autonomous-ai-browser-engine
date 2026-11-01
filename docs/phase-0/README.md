@@ -352,3 +352,18 @@ Connect the host URL Origin Registry to the JavaScript Runtime's opaque Origin/R
 - GitHub Actions Run 41281608108 exposed a Linux-only test-harness difference: the truncated-response mock server closed the Unix socket while the client request was still unread, so Linux reported ConnectionReset instead of the test's expected UnexpectedEof.
 - The mock server now reads the complete newline-terminated request before writing its deliberately truncated response and closing. This isolates the intended response-framing condition and avoids platform-dependent reset behavior.
 - Reverified locally on FreeBSD: UDS 17/17 and full workspace 88/88; fmt and Clippy pass. The corrected test is awaiting the next GitHub Actions run.
+
+## Per-origin descriptor grant hardening — 2026-11-01
+
+- Broker checks the connected renderer peer with FreeBSD `getpeereid()` and exact effective UID/GID matching before granting Origin A storage.
+- Renderer closes inherited Origin A and Origin B directory descriptors, then receives only the authorized Origin A directory descriptor over `SCM_RIGHTS`.
+- The receiver rejects ancillary messages containing multiple descriptors and invalid grant markers. Both negative tests verify that every installed descriptor is closed on rejection.
+- The delegated storage FD is restricted to `CAP_LOOKUP | CAP_READ | CAP_FSTAT`; cross-origin traversal and write/create attempts are denied after `cap_enter()`.
+- Broker closes its storage descriptor copies after transfer. Renderer acknowledges readiness over IPC; Broker waits for process exit.
+- The oversized UDS request test now tolerates an expected early BrokenPipe/ConnectionReset when the server rejects an over-limit frame, then validates the structured `request_too_large` response. The focused test passed 20/20 independent runs.
+- `scripts/run-security-pocs.sh`: all Capsicum, Broker/Renderer, UDS identity, storage delegation, malformed ancillary cleanup, renderer crash-recovery and Jail network-isolation checks passed.
+- FreeBSD workspace: 88/88 tests passed; Rustfmt and Clippy (`-D warnings`) passed. Changed C PoCs passed `clang --analyze`.
+- Latest commit: `e7fdf02d40fdf09bfdbfca347b66ce22d3b94894`, pushed to `main`; working tree clean.
+- GitHub Actions Run [41282807723](https://github.com/lycupay-debug/autonomous-ai-browser-engine/actions/runs/41282807723) is still running; Rust and supply-chain final conclusions are pending.
+- Remaining: process identity stronger than UID/GID, production Broker capability grants and revocation, per-peer quotas, rctl (host `kern.racct.enable=0`), multi-renderer scheduling, production storage semantics, network broker enforcement and hostile IPC stress.
+- This is a feasibility PoC, not a production Renderer Sandbox. No persistent host configuration or production service was changed.
